@@ -48,7 +48,7 @@ Flickable {
                     border.width: wallpaper.ready ? 2 : 0; border.color: Theme.pressed
                     anchors.verticalCenter: parent.verticalCenter
                     Icon { visible: !wallpaper.ready; anchors.centerIn: parent; name: "device"; size: 24; color: Store.connected ? Theme.accent : Theme.secondary }
-                    Picture { id: wallpaper; anchors { fill: parent; margins: 2 } radius: Math.max(0, parent.radius - 2); cache: false; source: Store.wallpaper; opacity: Store.connected ? 1 : 0.5 }
+                    Picture { id: wallpaper; anchors { fill: parent; margins: 2 } radius: Math.max(0, parent.radius - 2); source: Store.wallpaper; opacity: Store.connected ? 1 : 0.5 }
                 }
                 Column {
                     width: parent.width - 68 - buttons.width - 16

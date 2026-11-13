@@ -9,8 +9,6 @@ Item {
     id: picture
     property string source: ""
     property real radius: width / 2
-    // Off for a file that is rewritten in place.
-    property bool cache: true
     readonly property bool ready: probe.status === Image.Ready && canvas.loaded === source
 
     onRadiusChanged: canvas.requestPaint()
@@ -21,7 +19,6 @@ Item {
         id: probe
         source: picture.source
         asynchronous: true
-        cache: picture.cache
         visible: false
         onStatusChanged: canvas.requestPaint()
     }
@@ -31,16 +28,19 @@ Item {
         // The source whose pixels the canvas holds.
         property string loaded: ""
         function load() {
-            if (loaded !== "" && (!picture.cache || loaded !== picture.source)) unloadImage(loaded)
+            if (loaded !== "" && loaded !== picture.source) unloadImage(loaded)
             loaded = ""
             if (picture.source !== "" && available) loadImage(picture.source)
-            requestPaint()
+            check()
         }
-        onAvailableChanged: load()
-        onImageLoaded: {
+        // A file already loaded elsewhere in the app is ready at once and
+        // announces nothing, so look as well as listen.
+        function check() {
             if (picture.source !== "" && isImageLoaded(picture.source)) loaded = picture.source
             requestPaint()
         }
+        onAvailableChanged: load()
+        onImageLoaded: check()
         onPaint: {
             const ctx = getContext("2d")
             ctx.reset()

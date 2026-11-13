@@ -304,8 +304,29 @@ impl Core {
         self.phone_cache().join(format!("photos/{id}.jpg"))
     }
 
-    fn wallpaper_path(&self) -> std::path::PathBuf {
-        self.phone_cache().join("wallpaper.jpg")
+    /// The stored wallpaper, if there is one. Each new wallpaper gets a new
+    /// name, because the window keeps showing a file it has already loaded.
+    fn wallpaper_path(&self) -> Option<std::path::PathBuf> {
+        std::fs::read_dir(self.phone_cache()).ok()?.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| {
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("wallpaper") && n.ends_with(".jpg"))
+        })
+    }
+
+    fn store_wallpaper(&self, image: &str) -> bool {
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(image.as_bytes()) else { return false };
+        let old = self.wallpaper_path();
+        if old.as_ref().and_then(|p| std::fs::read(p).ok()).is_some_and(|had| had == bytes) {
+            return false;
+        }
+        let dir = self.phone_cache();
+        let _ = std::fs::create_dir_all(&dir);
+        if std::fs::write(dir.join(format!("wallpaper-{}.jpg", now_ms())), bytes).is_err() {
+            return false;
+        }
+        if let Some(old) = old {
+            let _ = std::fs::remove_file(old);
+        }
+        true
     }
 
     fn store_image(path: &std::path::Path, data: &str) -> bool {
@@ -343,9 +364,8 @@ impl Core {
     }
 
     fn emit_wallpaper(&self) {
-        let path = self.wallpaper_path();
-        let shown = !self.demo && path.exists();
-        self.send_ui("wallpaper", json!(if shown { format!("file://{}", path.display()) } else { String::new() }));
+        let path = self.wallpaper_path().filter(|_| !self.demo);
+        self.send_ui("wallpaper", json!(path.map(|p| format!("file://{}", p.display())).unwrap_or_default()));
     }
 
     /// App icons arrive inline; the window and the notification daemon both
@@ -929,7 +949,7 @@ impl Core {
                 }
             }
             Message::Wallpaper { image } => {
-                if Self::store_image(&self.wallpaper_path(), &image) {
+                if self.store_wallpaper(&image) {
                     self.emit_wallpaper();
                 }
             }

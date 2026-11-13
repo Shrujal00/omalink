@@ -23,7 +23,7 @@ QtObject {
     property var contacts: []
     // Contact picture by lowercased name and by number key.
     property var photos: ({})
-    // The phone's wallpaper as a file URL, or empty.
+    // The phone's wallpaper as a file URL, or empty. A new wallpaper is a new file.
     property string wallpaper: ""
     property var call: ({ phase: "idle", number: "", name: "", since: 0, audio: false, muted: false })
     property var clips: []
@@ -82,8 +82,7 @@ QtObject {
             }
             photos = found
             break
-        // Emptied first: the file keeps its name when the picture changes.
-        case "wallpaper": wallpaper = ""; wallpaper = data || ""; break
+        case "wallpaper": wallpaper = data || ""; break
         case "call": call = data; break
         case "clips": clips = data || []; break
         case "transfers": transfers = data || []; break

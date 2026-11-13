@@ -128,7 +128,7 @@ ApplicationWindow {
                     color: Store.connected ? Theme.accentSoft : Theme.hover
                     anchors { left: parent.left; leftMargin: 18; verticalCenter: parent.verticalCenter }
                     Icon { visible: !wallpaper.ready; anchors.centerIn: parent; name: "device"; size: 19; color: Store.connected ? Theme.accent : Theme.tertiary }
-                    Picture { id: wallpaper; anchors.fill: parent; radius: parent.radius; cache: false; source: Store.wallpaper; opacity: Store.connected ? 1 : 0.5 }
+                    Picture { id: wallpaper; anchors.fill: parent; radius: parent.radius; source: Store.wallpaper; opacity: Store.connected ? 1 : 0.5 }
                     Rectangle {
                         width: 10; height: 10; radius: 5
                         anchors { right: parent.right; bottom: parent.bottom; margins: -1 }
