@@ -1,6 +1,7 @@
 package io.omalink
 
 import android.app.Activity
+import android.app.DownloadManager
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.Typeface
@@ -8,29 +9,38 @@ import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
+import android.text.TextUtils
+import android.text.format.DateUtils
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 
 /**
- * The whole interface: whether the computer is connected, and what the user
- * has allowed. Everything else happens on the computer.
+ * The whole interface: the computer and whether it is connected, sending it
+ * files or the clipboard, what has been transferred, and what the user has
+ * allowed. Everything else happens on the computer.
  */
 class MainActivity : Activity() {
     private val backdrop = Color.parseColor("#16171B")
     private val surface = Color.parseColor("#1F2126")
-    private val foreground = Color.parseColor("#E6E8EC")
+    private val ink = Color.parseColor("#E6E8EC")
     private val secondary = Color.parseColor("#A4A9B3")
     private val accent = Color.parseColor("#9ECE6A")
     private val green = Color.parseColor("#7FC27A")
 
+    private companion object {
+        const val PICK = 7
+    }
+
+    /** Everything under the title; rebuilt whenever something changes. */
     private lateinit var list: LinearLayout
-    private lateinit var state: TextView
-    private lateinit var hint: TextView
+    private var showPermissions = false
 
     /** Settings switches the computer asked for, opened one per return to the app. */
     private val queue = ArrayDeque<String>()
@@ -55,23 +65,14 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(28), dp(20), dp(28))
         }
-        column.addView(text("Omalink", 28f, foreground, true))
+        column.addView(text("Omalink", 28f, ink, true))
         column.addView(text("FOR OMARCHY", 12f, accent, true).apply {
             typeface = Typeface.MONOSPACE
             letterSpacing = 0.18f
             setPadding(0, dp(2), 0, dp(6))
         })
-        state = text("", 15f, secondary).apply { setPadding(0, dp(6), 0, 0) }
-        column.addView(state)
-        hint = text("", 14f, secondary).apply { setPadding(0, dp(14), 0, dp(4)); setLineSpacing(0f, 1.2f) }
-        column.addView(hint)
-        column.addView(text("Permissions", 13f, secondary, true).apply { setPadding(0, dp(22), 0, dp(10)) })
         list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         column.addView(list, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
-        column.addView(text(
-            "If Android greys out Notification access or Messages for this app, open App info → ⋮ → Allow restricted settings. Android does that for apps installed outside the Play Store.",
-            12.5f, secondary,
-        ).apply { setPadding(0, dp(18), 0, 0); setLineSpacing(0f, 1.2f) })
 
         setContentView(ScrollView(this).apply {
             setBackgroundColor(backdrop)
@@ -137,30 +138,153 @@ class MainActivity : Activity() {
         try { startActivity(intent) } catch (e: Exception) { }
     }
 
+    private fun icon(resource: Int, size: Int, color: Int) = ImageView(this).apply {
+        setImageResource(resource)
+        setColorFilter(color)
+        layoutParams = LinearLayout.LayoutParams(dp(size), dp(size))
+    }
+
+    private fun spaced(view: View, top: Int) =
+        list.addView(view, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(top) })
+
+    /** One of the two big buttons under the computer. */
+    private fun tile(resource: Int, label: String, enabled: Boolean, action: () -> Unit) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        gravity = Gravity.CENTER
+        background = rounded(surface, 14)
+        setPadding(dp(8), dp(18), dp(8), dp(16))
+        alpha = if (enabled) 1f else 0.4f
+        addView(icon(resource, 24, if (enabled) accent else secondary))
+        addView(text(label, 13.5f, ink, true).apply { gravity = Gravity.CENTER; setPadding(0, dp(9), 0, 0) })
+        contentDescription = label
+        if (enabled) setOnClickListener { action() }
+    }
+
+    /** A full-width row that leads somewhere. */
+    private fun row(resource: Int, title: String, detail: String, tint: Int, action: () -> Unit) = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        background = rounded(surface, 14)
+        setPadding(dp(16), dp(15), dp(12), dp(15))
+        addView(icon(resource, 22, tint))
+        val labels = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(14), 0, 0, 0) }
+        labels.addView(text(title, 15f, ink, true))
+        if (detail.isNotEmpty()) labels.addView(text(detail, 12.5f, secondary))
+        addView(labels, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        addView(icon(R.drawable.ic_chevron, 18, secondary))
+        contentDescription = title
+        setOnClickListener { action() }
+    }
+
+    private fun start(intent: Intent) = try { startActivity(intent) } catch (e: Exception) { }
+
+    override fun onActivityResult(code: Int, result: Int, data: Intent?) {
+        super.onActivityResult(code, result, data)
+        if (code != PICK || result != RESULT_OK || data == null) return
+        val service = LinkService.instance ?: return
+        val clip = data.clipData
+        val files = if (clip != null) (0 until clip.itemCount).map { clip.getItemAt(it).uri } else listOfNotNull(data.data)
+        val sent = files.count { service.transfers.offer(this, it) }
+        if (sent > 0) Toast.makeText(this, if (sent == 1) "Sending to your computer…" else "Sending $sent files to your computer…", Toast.LENGTH_SHORT).show()
+    }
+
     private fun render() {
         val service = LinkService.instance
-        val bluetooth = Perms.granted(this, Perms.BLUETOOTH)
-        state.text = when {
-            !bluetooth -> "Needs permission to use Bluetooth"
-            service?.connected == true -> "Connected to ${service.peer.ifEmpty { "your computer" }}"
+        val connected = service?.connected == true
+        val missing = Perms.all.filter { !Perms.granted(this, it) }
+        list.removeAllViews()
+
+        // The computer, and whether it is there.
+        val hero = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(0, dp(18), 0, dp(4))
+        }
+        hero.addView(LinearLayout(this).apply {
+            gravity = Gravity.CENTER
+            background = rounded(surface, 28)
+            layoutParams = LinearLayout.LayoutParams(dp(112), dp(112))
+            addView(icon(R.drawable.ic_computer, 56, if (connected) accent else secondary))
+        })
+        hero.addView(text(if (connected) service?.peer?.ifEmpty { "Your computer" } ?: "Your computer" else "No computer connected", 20f, ink, true).apply {
+            gravity = Gravity.CENTER
+            setPadding(0, dp(14), 0, dp(4))
+        })
+        val status = when {
+            !Perms.granted(this, Perms.BLUETOOTH) -> "Needs permission to use Bluetooth"
+            connected -> "Connected"
             else -> "Waiting for your computer"
         }
-        state.setTextColor(if (service?.connected == true) green else secondary)
-        hint.text = if (service?.connected == true) {
-            "You can close this. To send text to the computer, share it to Omalink or tap “Send clipboard” in the notification."
-        } else {
-            "Pair this phone with your computer from Omalink on the desktop: open Bluetooth settings here so the phone can be found, then press Scan there."
+        hero.addView(text("●  $status", 14f, if (connected) green else secondary).apply { gravity = Gravity.CENTER })
+        spaced(hero, 0)
+
+        val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        actions.addView(tile(R.drawable.ic_send, "Send files", connected) {
+            val pick = Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*").putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+            try { startActivityForResult(pick, PICK) } catch (e: Exception) { }
+        }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { marginEnd = dp(6) })
+        actions.addView(tile(R.drawable.ic_clipboard, "Send clipboard", connected) {
+            start(Intent(this, ShareActivity::class.java).setAction(ShareActivity.SEND_CLIPBOARD))
+        }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { marginStart = dp(6) })
+        spaced(actions, 20)
+
+        if (!connected) {
+            spaced(text(
+                "Pair this phone from Omalink on your computer: open Bluetooth settings here so the phone can be found, then press Scan there.",
+                13.5f, secondary,
+            ).apply { setLineSpacing(0f, 1.2f) }, 16)
         }
 
-        list.removeAllViews()
-        val missing = Perms.all.filter { !Perms.granted(this, it) }
+        // What has gone back and forth since the app started.
+        val recent = service?.transfers?.recent()?.take(5) ?: emptyList()
+        if (recent.isNotEmpty()) {
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                background = rounded(surface, 14)
+                setPadding(dp(16), dp(14), dp(16), dp(8))
+            }
+            card.addView(text("Recent", 15f, ink, true).apply { setPadding(0, 0, 0, dp(6)) })
+            for (item in recent) {
+                val line = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(0, dp(9), 0, dp(9))
+                }
+                line.addView(icon(if (item.incoming) R.drawable.ic_in else R.drawable.ic_out, 20, accent))
+                val labels = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(14), 0, 0, 0) }
+                labels.addView(text(item.name, 14.5f, ink, true).apply { maxLines = 1; ellipsize = TextUtils.TruncateAt.MIDDLE })
+                val time = DateUtils.getRelativeTimeSpanString(item.time, System.currentTimeMillis(), DateUtils.MINUTE_IN_MILLIS)
+                labels.addView(text((if (item.incoming) "From your computer" else "Sent to your computer") + "  ·  $time", 12.5f, secondary))
+                line.addView(labels, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+                item.uri?.let { uri ->
+                    line.setOnClickListener {
+                        start(Intent(Intent.ACTION_VIEW).setDataAndType(uri, contentResolver.getType(uri) ?: "*/*").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+                    }
+                }
+                card.addView(line)
+            }
+            spaced(card, 16)
+        }
+
+        spaced(row(R.drawable.ic_folder, "Received files", "Downloads/Omalink", secondary) {
+            start(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS))
+        }, 16)
+        // Open by itself while something still needs allowing.
+        val open = showPermissions || missing.isNotEmpty()
+        spaced(row(
+            R.drawable.ic_shield, "App permissions",
+            if (missing.isEmpty()) "Everything is allowed" else "${missing.size} still to allow",
+            if (missing.isEmpty()) secondary else accent,
+        ) { showPermissions = !showPermissions; render() }, 8)
+        if (!open) return
+
         if (missing.size > 1) {
-            list.addView(text("Allow everything", 15f, Color.BLACK, true).apply {
+            spaced(text("Allow everything", 15f, Color.BLACK, true).apply {
                 gravity = Gravity.CENTER
                 background = rounded(accent, 12)
                 setPadding(0, dp(13), 0, dp(13))
                 setOnClickListener { request(missing) }
-            }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { bottomMargin = dp(12) })
+            }, 12)
         }
         for (name in Perms.all) {
             val (title, detail) = Perms.labels[name] ?: continue
@@ -172,7 +296,7 @@ class MainActivity : Activity() {
                 setPadding(dp(16), dp(13), dp(14), dp(13))
             }
             val labels = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-            labels.addView(text(title, 15f, foreground, true))
+            labels.addView(text(title, 15f, ink, true))
             labels.addView(text(detail, 13f, secondary))
             row.addView(labels, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
             row.addView(text(if (ok) "Allowed" else "Allow", 13.5f, if (ok) green else accent, true).apply {
@@ -180,8 +304,11 @@ class MainActivity : Activity() {
             })
             if (!ok) row.setOnClickListener { request(listOf(name)) }
             row.contentDescription = "$title, ${if (ok) "allowed" else "not allowed"}"
-            list.addView(row, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { bottomMargin = dp(8) })
+            spaced(row, 8)
         }
-        list.visibility = View.VISIBLE
+        spaced(text(
+            "If Android greys out Notification access or Messages for this app, open App info → ⋮ → Allow restricted settings. Android does that for apps installed outside the Play Store.",
+            12.5f, secondary,
+        ).apply { setLineSpacing(0f, 1.2f) }, 14)
     }
 }

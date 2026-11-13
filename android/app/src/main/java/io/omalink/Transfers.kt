@@ -5,12 +5,14 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.ContentValues
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
+import android.provider.OpenableColumns
 import android.util.Base64
 import android.widget.Toast
 import org.json.JSONArray
@@ -46,9 +48,44 @@ class Transfers(private val service: LinkService) {
         const val WAIT_MS = 20_000
     }
 
+    /** A finished transfer, for the app's home screen. */
+    class Recent(val name: String, val incoming: Boolean, val time: Long, val uri: Uri?)
+
     private val main = Handler(Looper.getMainLooper())
     private val random = SecureRandom()
     private var notified = 100
+    private val history = ArrayList<Recent>()
+
+    /** Newest first. Kept only while the app is running. */
+    fun recent(): List<Recent> = synchronized(history) { ArrayList(history) }
+
+    private fun remember(name: String, incoming: Boolean, uri: Uri?) {
+        synchronized(history) {
+            history.add(0, Recent(name, incoming, System.currentTimeMillis(), uri))
+            while (history.size > 20) history.removeAt(history.size - 1)
+        }
+        main.post { service.onChange?.invoke() }
+    }
+
+    /**
+     * Sends what `uri` points at. It is opened here, while the caller still
+     * holds the right to read it; the open stream outlives that.
+     */
+    fun offer(context: Context, uri: Uri): Boolean = try {
+        var name = uri.lastPathSegment?.substringAfterLast('/') ?: "file"
+        var size = -1L
+        context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                cursor.getString(0)?.let { name = it }
+                if (!cursor.isNull(1)) size = cursor.getLong(1)
+            }
+        }
+        val input = context.contentResolver.openInputStream(uri)
+        if (input != null) offer(name, size, input)
+        input != null
+    } catch (e: Exception) {
+        false
+    }
 
     private fun say(text: String) = main.post { Toast.makeText(service, text, Toast.LENGTH_LONG).show() }
 
@@ -125,6 +162,7 @@ class Transfers(private val service: LinkService) {
                 socket.soTimeout = 10_000
                 try { socket.getInputStream().read() } catch (e: Exception) { }
                 say("Sent $name to your computer")
+                remember(name, false, null)
             } catch (e: java.net.SocketTimeoutException) {
                 say("Your computer couldn't reach the phone. Put both on the same Wi-Fi")
             } catch (e: Exception) {
@@ -173,6 +211,7 @@ class Transfers(private val service: LinkService) {
                 }
                 resolver.update(uri, ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }, null, null)
                 saved(true)
+                remember(safe, true, uri)
                 arrived(safe, uri)
             } catch (e: Exception) {
                 uri?.let { try { resolver.delete(it, null, null) } catch (e: Exception) { } }

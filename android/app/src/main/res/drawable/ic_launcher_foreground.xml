@@ -1,5 +1,15 @@
+<!-- A desktop monitor with a phone in front of it, drawn on a 512 grid and
+     scaled into the middle of the adaptive icon's safe zone. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
-    <path android:strokeColor="#16171B" android:strokeWidth="5" android:strokeLineCap="round" android:strokeLineJoin="round"
-        android:pathData="M44,30h20a4,4 0,0 1,4 4v40a4,4 0,0 1,-4 4H44a4,4 0,0 1,-4 -4V34a4,4 0,0 1,4 -4zM51,70h6" />
+    <group android:scaleX="0.165" android:scaleY="0.165" android:translateX="11.7" android:translateY="9.5">
+        <path android:strokeColor="#A6D872" android:strokeWidth="26" android:strokeLineCap="round" android:strokeLineJoin="round"
+            android:pathData="M116,118h240a30,30 0,0 1,30 30v148a30,30 0,0 1,-30 30H116a30,30 0,0 1,-30 -30V148a30,30 0,0 1,30 -30zM176,372h120M236,330v40" />
+        <path android:fillColor="#0F140F"
+            android:pathData="M326,196h78a36,36 0,0 1,36 36v166a36,36 0,0 1,-36 36h-78a36,36 0,0 1,-36 -36V232a36,36 0,0 1,36 -36z" />
+        <path android:fillColor="#A6D872"
+            android:pathData="M330,212h70a24,24 0,0 1,24 24v158a24,24 0,0 1,-24 24h-70a24,24 0,0 1,-24 -24V236a24,24 0,0 1,24 -24z" />
+        <path android:fillColor="#10160E"
+            android:pathData="M350,230h30a5,5 0,0 1,0 10h-30a5,5 0,0 1,0 -10z" />
+    </group>
 </vector>

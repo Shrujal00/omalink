@@ -5,7 +5,6 @@ import android.content.ClipboardManager
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
-import android.provider.OpenableColumns
 import android.widget.Toast
 
 /**
@@ -39,30 +38,12 @@ class ShareActivity : Activity() {
         }
     }
 
-    /**
-     * Each file is opened here, while this activity still holds the sharing
-     * app's permission to read it; the open stream outlives the activity.
-     */
     private fun sendFiles(files: List<Uri>) {
         done = true
         val service = LinkService.instance
         var sent = 0
         if (service != null && service.connected) {
-            for (uri in files) {
-                try {
-                    var name = uri.lastPathSegment?.substringAfterLast('/') ?: "file"
-                    var size = -1L
-                    contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { cursor ->
-                        if (cursor.moveToFirst()) {
-                            cursor.getString(0)?.let { name = it }
-                            if (!cursor.isNull(1)) size = cursor.getLong(1)
-                        }
-                    }
-                    val input = contentResolver.openInputStream(uri) ?: continue
-                    service.transfers.offer(name, size, input)
-                    sent++
-                } catch (e: Exception) { }
-            }
+            for (uri in files) if (service.transfers.offer(this, uri)) sent++
         }
         val message = when {
             service == null || !service.connected -> "Your computer isn't connected"
