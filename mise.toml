@@ -1,0 +1,4 @@
+[tools]
+rust = "stable"
+java = "21"
+gradle = "8"

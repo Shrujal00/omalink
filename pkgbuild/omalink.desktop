@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Omalink
+GenericName=Phone Link for Omarchy
+Comment=Your Android phone on Omarchy: messages, calls, notifications, and clipboard
+Exec=omalink
+Icon=omalink
+Terminal=false
+Categories=Utility;Network;Telephony;
+Keywords=omarchy;phone;link;android;sms;bluetooth;call;notifications;clipboard;
+StartupWMClass=omalink

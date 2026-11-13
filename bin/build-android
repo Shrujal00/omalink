@@ -1,0 +1,29 @@
+#!/bin/sh
+# Builds the phone app: the Rust core for arm64, then the APK around it.
+# Run bin/setup-android once first.
+set -eu
+
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+SDK="${ANDROID_HOME:-$HOME/Android/Sdk}"
+NDK="$SDK/ndk/27.2.12479018"
+cd "$ROOT"
+
+[ -d "$NDK" ] || { echo "Android NDK not found. Run bin/setup-android first." >&2; exit 1; }
+
+TOOLS="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$TOOLS/aarch64-linux-android29-clang"
+export CC_aarch64_linux_android="$TOOLS/aarch64-linux-android29-clang"
+export AR_aarch64_linux_android="$TOOLS/llvm-ar"
+mise exec -- cargo build --release -p omalink-core --target aarch64-linux-android
+
+LIBS="$ROOT/android/app/src/main/jniLibs/arm64-v8a"
+mkdir -p "$LIBS"
+cp target/aarch64-linux-android/release/libomalink_core.so "$LIBS/"
+
+cd "$ROOT/android"
+ANDROID_HOME="$SDK" JAVA_HOME="$(mise where java)" mise exec -- gradle --quiet assembleRelease
+
+mkdir -p "$ROOT/build"
+cp app/build/outputs/apk/release/app-release.apk "$ROOT/build/omalink.apk"
+echo "Built $ROOT/build/omalink.apk"
+echo "Install it with: $SDK/platform-tools/adb install -r build/omalink.apk"

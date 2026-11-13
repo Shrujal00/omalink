@@ -1,0 +1,17 @@
+#!/bin/sh
+# Builds the desktop app into build/omalink.
+set -eu
+
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+cd "$ROOT"
+
+# Rust comes from mise when it isn't already on the PATH.
+if command -v cargo >/dev/null 2>&1; then CARGO=cargo; else CARGO="mise exec -- cargo"; fi
+
+$CARGO build --release -p omalink
+mkdir -p build
+# Renamed into place, so this works while the app is running from there.
+cp target/release/omalink build/omalink.new
+mv build/omalink.new build/omalink
+
+echo "Built $ROOT/build/omalink"

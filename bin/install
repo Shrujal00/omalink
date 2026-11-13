@@ -1,0 +1,8 @@
+#!/bin/sh
+# Builds the Arch package and installs it, so Omalink shows in the launcher.
+set -eu
+
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+"$ROOT/bin/build"
+cd "$ROOT/pkgbuild"
+exec makepkg -fsi "$@"

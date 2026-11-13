@@ -1,0 +1,17 @@
+#!/bin/sh
+# Runs the protocol and desktop tests, then loads the real window offscreen
+# so a QML error fails here rather than on first launch.
+set -eu
+
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+cd "$ROOT"
+
+if command -v cargo >/dev/null 2>&1; then CARGO=cargo; else CARGO="mise exec -- cargo"; fi
+
+$CARGO test -p omalink-proto -p omalink
+$CARGO build -p omalink
+
+SHOT="$(mktemp -d)/window.png"
+OMALINK_SHOT="$SHOT:0" QT_QPA_PLATFORM=offscreen QT_FORCE_STDERR_LOGGING=1 timeout 20 target/debug/omalink --demo
+test -s "$SHOT" || { echo "The window failed to render." >&2; exit 1; }
+echo "Window rendered: $SHOT"

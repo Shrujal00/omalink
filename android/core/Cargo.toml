@@ -1,0 +1,13 @@
+[package]
+name = "omalink-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+omalink-proto = { path = "../../crates/proto" }
+serde_json.workspace = true
+jni = { version = "0.21", default-features = false }
