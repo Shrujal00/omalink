@@ -239,6 +239,7 @@ impl Core {
                 "address": self.config.device,
                 "name": name,
                 "error": if self.link.is_some() { "" } else { self.link_error.as_str() },
+                "stale": self.link.is_none() && self.link_error == bluez::STALE_PAIRING,
                 "calls": self.telephony.modem.is_some(),
             }),
         );
@@ -651,6 +652,10 @@ impl Core {
             }
             Event::ConnectFailed(reason) => {
                 self.connecting = None;
+                // A thrown-away pairing won't come back: stop hammering the phone.
+                if reason == bluez::STALE_PAIRING {
+                    self.backoff = 60;
+                }
                 self.link_error = reason;
                 self.retry_later();
                 self.emit_link();

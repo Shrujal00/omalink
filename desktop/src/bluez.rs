@@ -167,6 +167,10 @@ async fn call<B: serde::Serialize + zbus::zvariant::DynamicType>(
         .map_err(explain)
 }
 
+/// The computer still holds a pairing the phone has thrown away. Retrying
+/// can never work; only pairing afresh does.
+pub const STALE_PAIRING: &str = "The phone no longer has this pairing. Pair again, and if the phone still lists this computer under Bluetooth, forget it there first.";
+
 /// BlueZ's errors are terse and some are cryptic; say what the user can do.
 pub fn explain(error: zbus::Error) -> String {
     let raw = match &error {
@@ -176,7 +180,9 @@ pub fn explain(error: zbus::Error) -> String {
         other => other.to_string(),
     };
     let lower = raw.to_lowercase();
-    if lower.contains("profile-unavailable") || lower.contains("connection refused") || lower.contains("notavailable") {
+    if lower.contains("key-missing") {
+        STALE_PAIRING.into()
+    } else if lower.contains("profile-unavailable") || lower.contains("connection refused") || lower.contains("notavailable") {
         "The phone isn't listening. Open Omalink on the phone.".into()
     } else if lower.contains("page-timeout") || lower.contains("host is down") || lower.contains("connection-unknown") {
         "The phone is out of range or has Bluetooth off.".into()

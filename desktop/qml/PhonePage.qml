@@ -87,7 +87,9 @@ Flickable {
                     spacing: 6
                     Btn { visible: Store.connected; icon: "ring"; text: qsTr("Find"); hint: qsTr("Ring the phone"); onClicked: Store.send("find_phone") }
                     Btn { visible: Store.connected; text: qsTr("Disconnect"); kind: "ghost"; tint: Theme.secondary; onClicked: Store.send("disconnect") }
-                    Btn { visible: !Store.connected && Store.link.state !== "none"; text: qsTr("Connect"); kind: "primary"; enabled: Store.link.state !== "connecting"; onClicked: Store.send("connect") }
+                    Btn { visible: !Store.connected && Store.link.state !== "none" && !Store.link.stale; text: qsTr("Connect"); kind: "primary"; enabled: Store.link.state !== "connecting"; onClicked: Store.send("connect") }
+                    // The old pairing is dead: drop it here, which leads back to setup.
+                    Btn { visible: !Store.connected && !!Store.link.stale && page.linked !== null; text: qsTr("Pair again"); kind: "primary"; onClicked: Store.send("forget", { path: page.linked.path }) }
                 }
             }
         }
