@@ -30,9 +30,35 @@ QtObject {
 
     // Small things never round more than a little, however round the windows.
     readonly property int small: Math.min(6, radius)
+    // Cards round a little more than buttons, still capped well below windows.
+    readonly property int card: Math.min(10, radius)
     readonly property string font: "Adwaita Sans"
     readonly property int quick: 140
     readonly property int smooth: 240
+
+    // Type scale. Pages use these, not literal sizes.
+    readonly property int display: 26
+    readonly property int title: 18
+    readonly property int heading: 15
+    readonly property int body: 14
+    readonly property int label: 13
+    readonly property int caption: 12
+
+    // Spacing steps.
+    readonly property int s1: 4
+    readonly property int s2: 8
+    readonly property int s3: 12
+    readonly property int s4: 16
+    readonly property int s5: 24
+    readonly property int s6: 32
+
+    // Elevation: page → card → something floating over cards.
+    readonly property color overlay: Qt.lighter(surface, 1.18)
+    readonly property color scrim: Qt.rgba(0, 0, 0, 0.55)
+    readonly property color accentLine: Qt.rgba(accent.r, accent.g, accent.b, 0.55)
+
+    // How wide a page's content may grow, and its side margin, for a width.
+    function margin(width) { return width >= 1400 ? 40 : width >= 900 ? 28 : 18 }
 
     function apply(t) {
         if (!t || !t.background)

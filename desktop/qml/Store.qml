@@ -29,6 +29,14 @@ QtObject {
     property var clips: []
     property var transfers: []
     property var pairing: null
+    // Demo screenshots only: shows the drop overlay without a real drag.
+    property bool demoDrop: false
+    // The network link: this computer's node, paired phones, pairing.
+    // The phone's photos and videos, as far as they've been loaded.
+    property var gallery: ({ items: [], more: false, loading: false })
+    // Screen sharing from the phone.
+    property var mirror: ({ state: "idle", icon: "", icon_name: "", width: 0, height: 0, control: false, fps: 0, reason: "", available: false, route: "" })
+    property var net: ({ state: "off", error: "", id: "", name: "", connected: false, route: "", relay: "", phones: [], pairing: null })
 
     readonly property bool connected: link.state === "connected"
     readonly property int unread: conversations.reduce((n, c) => n + (c.unread || 0), 0)
@@ -38,8 +46,9 @@ QtObject {
     signal show(string page)
     signal ready(bool visible)
     signal threadLoaded()
+    signal demoTab(string tab)
     signal quit()
-    signal shot(string path, int page, int delay)
+    signal shot(string path, var page, int delay, int width, int height)
 
     // Ticks once a minute so "4 min ago" stays true without anything changing.
     property int minute: 0
@@ -87,10 +96,15 @@ QtObject {
         case "clips": clips = data || []; break
         case "transfers": transfers = data || []; break
         case "pairing": pairing = data; break
+        case "net": net = data; break
+        case "demo_drop": demoDrop = !!data; break
+        case "demo_tab": demoTab(data); break
+        case "mirror": mirror = data; break
+        case "gallery": gallery = data; break
         case "note": note(data.text); break
         case "show": show(data && data.page ? data.page : ""); break
         case "ready": ready(data.show); break
-        case "shot": shot(data.path, data.page, data.delay || 900); break
+        case "shot": shot(data.path, data.page, data.delay || 900, data.width || 0, data.height || 0); break
         case "quit": quit(); break
         }
     }
@@ -104,7 +118,9 @@ QtObject {
         "call_log": [qsTr("Call history"), qsTr("Show recent calls")],
         "phone": [qsTr("Phone"), qsTr("Place, answer, and end calls")],
         "battery": [qsTr("Run in background"), qsTr("Stop Android from putting the app to sleep")],
-        "wallpaper": [qsTr("Wallpaper"), qsTr("Show the phone's wallpaper here. Android asks for all files access to read it")]
+        "wallpaper": [qsTr("Wallpaper"), qsTr("Show the phone's wallpaper here. Android asks for all files access to read it")],
+        "photos": [qsTr("Photos and videos"), qsTr("Browse, download and delete the phone's gallery from here")],
+        "control": [qsTr("Control from this computer"), qsTr("Use the mouse and keyboard on the phone while its screen is shared. Switched on under Accessibility on the phone")]
     })
 
     function has(permission) { return granted.indexOf(permission) >= 0 }

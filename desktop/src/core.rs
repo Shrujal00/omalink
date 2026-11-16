@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use omalink_proto::{
-    number_key, permission, CallEntry, CallPhase, Contact, Conversation, Message, Notification, PhoneStatus,
+    number_key, permission, CallEntry, CallPhase, Contact, Conversation, InputKind, Message, Notification, PhoneMedia, PhoneStatus,
     PROTOCOL_VERSION, SERVICE_UUID,
 };
 use serde::{Deserialize, Serialize};
@@ -20,9 +20,13 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use zbus::Connection;
 
+use omalink_net::{Conn, Node, Peer, Trust};
+use omalink_proto::pair::{self, Shower};
+
 use crate::desktop::{self, Toast};
 use crate::link::Link;
-use crate::{bluez, link, telephony, transfer};
+use crate::net::Session;
+use crate::{bluez, link, net, telephony, transfer};
 
 pub type Emit = Arc<dyn Fn(&str, String) + Send + Sync>;
 
@@ -43,8 +47,53 @@ pub enum Event {
     Theme(Json),
     TransferProgress { key: String, done: u64 },
     TransferEnd { key: String, done: u64, error: Option<String> },
+    Thumb { key: String, path: String },
     Tick,
+
+    // The network link.
+    NetReady(Arc<Node>),
+    NetFailed(String),
+    NetIncoming { alpn: Vec<u8>, conn: Conn },
+    NetDown { serial: u64, reason: String },
+    NetPeer { serial: u64, message: Message },
+    NetRoute { serial: u64, route: String },
+    NetFileIncoming(Transfer),
+
+    // Mirroring the phone's screen.
+    MirrorLive { serial: u64, width: u32, height: u32 },
+    MirrorFps { serial: u64, fps: u32 },
+    MirrorKeyframe { serial: u64 },
+    MirrorStreamEnd { serial: u64 },
+    MirrorFailed { serial: u64, reason: String },
 }
+
+/// A screen-sharing session, as the Mirror page shows it.
+#[derive(Default)]
+struct Mirror {
+    /// "idle"; "requested" until the phone starts the icon check; "verify"
+    /// while the icon is on screen; "approving" while Android asks on the
+    /// phone; "live"; or "ended", with `reason`.
+    state: &'static str,
+    icon: Option<usize>,
+    width: u32,
+    height: u32,
+    control: bool,
+    fps: u32,
+    reason: String,
+}
+
+/// The desktop's side of pairing a phone over the network.
+struct Pairing {
+    until: Instant,
+    attempts: u32,
+    session: Option<Session>,
+    phone_name: String,
+    icon: Option<usize>,
+}
+
+/// How long pairing stays open, and how many wrong taps it forgives.
+const PAIR_WINDOW: Duration = Duration::from_secs(180);
+const PAIR_ATTEMPTS: u32 = 3;
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
@@ -54,6 +103,8 @@ pub struct Config {
     pub clipboard: bool,
     pub toasts: bool,
     pub calls: bool,
+    /// The relay to fall back on, or empty for the public ones.
+    pub relay: String,
     /// Thread → time of its newest message when it was last opened here.
     /// The phone can't always be told a thread was read, so the desktop
     /// remembers for itself.
@@ -62,7 +113,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { device: String::new(), clipboard: true, toasts: true, calls: true, seen: HashMap::new() }
+        Self { device: String::new(), clipboard: true, toasts: true, calls: true, relay: String::new(), seen: HashMap::new() }
     }
 }
 
@@ -99,8 +150,125 @@ pub struct Clip {
     pub from: &'static str,
 }
 
+/// What outlives a restart: finished transfers and the clipboard history,
+/// kept readable by the owner only (copied text can be private).
+#[derive(Serialize, Deserialize, Default)]
+struct History {
+    #[serde(default)]
+    transfers: Vec<StoredTransfer>,
+    #[serde(default)]
+    clips: Vec<StoredClip>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredTransfer {
+    key: String,
+    name: String,
+    size: i64,
+    done: u64,
+    incoming: bool,
+    state: String,
+    #[serde(default)]
+    error: String,
+    path: String,
+    time: i64,
+    #[serde(default)]
+    via: String,
+    #[serde(default)]
+    kind: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredClip {
+    text: String,
+    time: i64,
+    from: String,
+}
+
+/// The one of `options` that `text` names, or the first.
+fn known(text: &str, options: &[&'static str]) -> &'static str {
+    options.iter().copied().find(|o| *o == text).unwrap_or(options[0])
+}
+
+impl History {
+    fn path() -> std::path::PathBuf {
+        let base = std::env::var("XDG_STATE_HOME")
+            .unwrap_or_else(|_| format!("{}/.local/state", std::env::var("HOME").unwrap_or_default()));
+        std::path::PathBuf::from(base).join("omalink/history.json")
+    }
+
+    fn load() -> (Vec<Transfer>, Vec<Clip>) {
+        let history: History = std::fs::read(Self::path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let transfers = history
+            .transfers
+            .into_iter()
+            .map(|t| Transfer {
+                key: t.key,
+                name: t.name,
+                size: t.size,
+                done: t.done,
+                incoming: t.incoming,
+                state: known(&t.state, &["done", "failed"]),
+                error: t.error,
+                path: t.path,
+                time: t.time,
+                via: known(&t.via, &["network", "bluetooth"]),
+                kind: known(&t.kind, &["other", "image", "video", "audio", "archive", "apk", "doc"]),
+                eta: -1,
+                ..Default::default()
+            })
+            .collect();
+        let clips = history
+            .clips
+            .into_iter()
+            .map(|c| Clip { text: c.text, time: c.time, from: known(&c.from, &["desktop", "phone"]) })
+            .collect();
+        (transfers, clips)
+    }
+
+    fn save(transfers: &[Transfer], clips: &[Clip]) {
+        let history = History {
+            transfers: transfers
+                .iter()
+                .filter(|t| t.state == "done" || t.state == "failed")
+                .map(|t| StoredTransfer {
+                    key: t.key.clone(),
+                    name: t.name.clone(),
+                    size: t.size,
+                    done: t.done,
+                    incoming: t.incoming,
+                    state: t.state.into(),
+                    error: t.error.clone(),
+                    path: t.path.clone(),
+                    time: t.time,
+                    via: t.via.into(),
+                    kind: t.kind.into(),
+                })
+                .collect(),
+            clips: clips.iter().map(|c| StoredClip { text: c.text.clone(), time: c.time, from: c.from.into() }).collect(),
+        };
+        let path = Self::path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let temp = path.with_extension("json.tmp");
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temp)
+            .and_then(|mut f| f.write_all(&serde_json::to_vec(&history).unwrap_or_default()));
+        if written.is_ok() {
+            let _ = std::fs::rename(temp, path);
+        }
+    }
+}
+
 /// A file going to or coming from the phone, as the Files page lists it.
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Default)]
 pub struct Transfer {
     /// See `transfer::key`.
     pub key: String,
@@ -114,6 +282,19 @@ pub struct Transfer {
     /// Where the file is on this computer.
     pub path: String,
     pub time: i64,
+    /// "bluetooth" when Bluetooth arranged it, "network" when the network
+    /// link carries it.
+    pub via: &'static str,
+    /// See `thumbs::kind`.
+    pub kind: &'static str,
+    /// A file URL of its thumbnail, once there is one.
+    pub thumb: String,
+    /// Bytes a second, and seconds left (-1 when unknown), while it moves.
+    pub speed: f64,
+    pub eta: i64,
+    /// The last progress report, for working out the speed.
+    #[serde(skip)]
+    pub sample: Option<(Instant, u64)>,
 }
 
 pub fn now_ms() -> i64 {
@@ -165,6 +346,24 @@ pub struct Core {
     pub transfers: Vec<Transfer>,
     transfer_id: u64,
     published: String,
+
+    node: Option<Arc<Node>>,
+    net_state: &'static str,
+    net_error: String,
+    trust: Trust,
+    net_link: Option<Session>,
+    net_route: String,
+    pairing: Option<Pairing>,
+    /// An icon verification under way, on the session with this serial.
+    verify: Option<(u64, Shower)>,
+    mirror: Mirror,
+
+    /// The phone's gallery as far as it has been loaded, newest first, with
+    /// each thumbnail as a file URL.
+    gallery: Vec<PhoneMedia>,
+    gallery_cursor: i64,
+    gallery_more: bool,
+    gallery_loading: bool,
 }
 
 fn arg_str(args: &Json, key: &str) -> String {
@@ -188,17 +387,23 @@ impl Core {
         self.send_ui("note", json!({ "text": text }));
     }
 
+    /// Bluetooth when it's up, the network otherwise.
     fn to_phone(&self, message: Message) -> bool {
-        match &self.link {
-            Some(link) => {
-                link.send(message);
-                true
-            }
-            None => {
-                self.note("The phone isn't connected.");
-                false
-            }
+        if let Some(link) = &self.link {
+            link.send(message);
+            true
+        } else if let Some(session) = &self.net_link {
+            session.send(message);
+            true
+        } else {
+            self.note("The phone isn't connected.");
+            false
         }
+    }
+
+    /// Whether the phone can be talked to at all.
+    fn connected(&self) -> bool {
+        self.link.is_some() || self.net_link.is_some()
     }
 
     fn device(&self) -> Option<&bluez::Device> {
@@ -217,7 +422,7 @@ impl Core {
     }
 
     fn emit_link(&self) {
-        let state = if self.link.is_some() {
+        let state = if self.connected() {
             "connected"
         } else if self.config.device.is_empty() {
             "none"
@@ -232,17 +437,223 @@ impl Core {
             Some(d) if !d.name.is_empty() => d.name.clone(),
             _ => self.peer_name.clone(),
         };
+        let name = if name.is_empty() {
+            self.net_link.as_ref().and_then(|s| self.trust.name(&s.id)).unwrap_or_default().to_string()
+        } else {
+            name
+        };
         self.send_ui(
             "link",
             json!({
                 "state": state,
+                "via": if self.link.is_some() { "bluetooth" } else if self.net_link.is_some() { "network" } else { "" },
                 "address": self.config.device,
                 "name": name,
-                "error": if self.link.is_some() { "" } else { self.link_error.as_str() },
+                "error": if self.connected() { "" } else { self.link_error.as_str() },
                 "stale": self.link.is_none() && self.link_error == bluez::STALE_PAIRING,
                 "calls": self.telephony.modem.is_some(),
             }),
         );
+    }
+
+    fn emit_net(&self) {
+        let connected = self.net_link.as_ref().map(|s| s.id.clone()).unwrap_or_default();
+        let phones: Vec<Json> = self
+            .trust
+            .peers
+            .iter()
+            .map(|p| json!({ "id": p.id, "name": p.name, "added": p.added, "connected": p.id == connected }))
+            .collect();
+        let pairing = self.pairing.as_ref().map(|p| {
+            json!({
+                "phone": p.phone_name,
+                "icon": p.icon.map(|i| pair::ICONS[i].0).unwrap_or(""),
+                "icon_name": p.icon.map(|i| pair::ICONS[i].1).unwrap_or(""),
+                "attempts": p.attempts,
+                "left": PAIR_ATTEMPTS.saturating_sub(p.attempts),
+            })
+        });
+        self.send_ui(
+            "net",
+            json!({
+                "state": self.net_state,
+                "error": self.net_error,
+                "id": self.node.as_ref().map(|n| n.id()).unwrap_or_default(),
+                "name": hostname(),
+                "connected": self.net_link.is_some(),
+                "route": if self.net_link.is_some() { self.net_route.as_str() } else { "" },
+                "relay": self.config.relay,
+                "phones": phones,
+                "pairing": pairing,
+            }),
+        );
+    }
+
+    fn open_pairing(&mut self) {
+        let Some(node) = self.node.clone() else {
+            return self.note("Networking hasn't started yet.");
+        };
+        node.set_pairing(Some(&hostname()));
+        self.pairing = Some(Pairing { until: Instant::now() + PAIR_WINDOW, attempts: 0, session: None, phone_name: String::new(), icon: None });
+        // A phone on Bluetooth learns where to find this computer even if
+        // they're not on the same network.
+        if let Some(link) = &self.link {
+            link.send(Message::NetInvite { id: node.id(), name: hostname() });
+        }
+        self.emit_net();
+    }
+
+    fn close_pairing(&mut self) {
+        if let Some(pairing) = self.pairing.take() {
+            if let Some(session) = pairing.session {
+                if self.verify.as_ref().is_some_and(|(serial, _)| *serial == session.serial) {
+                    self.verify = None;
+                }
+                net::retire(session);
+            }
+        }
+        if let Some(node) = &self.node {
+            node.set_pairing(None);
+        }
+        self.emit_net();
+    }
+
+    /// The desktop's half of icon verification, on a pairing session or the
+    /// link. Returns false for messages that aren't part of it.
+    fn handle_verify(&mut self, serial: u64, message: &Message) -> bool {
+        let on_pairing = self.pairing.as_ref().and_then(|p| p.session.as_ref()).is_some_and(|s| s.serial == serial);
+        let session = if on_pairing {
+            self.pairing.as_ref().and_then(|p| p.session.as_ref())
+        } else {
+            self.net_link.as_ref().filter(|s| s.serial == serial)
+        };
+        let Some(session) = session else { return false };
+        let Some(node) = &self.node else { return false };
+        match message {
+            Message::VerifyCommit { purpose, commit } => {
+                // A pairing session verifies pairing; the link only mirroring.
+                let allowed = if on_pairing { purpose == pair::PAIR } else { purpose == pair::MIRROR && self.mirror.state == "requested" };
+                let ours = omalink_net::id_bytes(&node.endpoint.id());
+                let theirs = omalink_net::id_bytes(&session.conn.remote_id());
+                let nonce = omalink_net::random32();
+                match Shower::new(purpose, &ours, &theirs, commit, &nonce).ok().filter(|_| allowed) {
+                    Some(shower) => {
+                        session.send(Message::VerifyNonce { nonce: pair::to_hex(&nonce) });
+                        self.verify = Some((serial, shower));
+                    }
+                    None => session.send(Message::VerifyDone { ok: false }),
+                }
+            }
+            Message::VerifyReveal { nonce } => {
+                let Some((_, shower)) = self.verify.as_mut().filter(|(s, _)| *s == serial) else { return true };
+                match shower.reveal(nonce) {
+                    Ok(sas) => {
+                        // Development builds say which icon is on screen, so
+                        // a scripted phone can tap it; release builds never do.
+                        #[cfg(debug_assertions)]
+                        eprintln!("omalink: showing icon {}", pair::ICONS[sas.icon].1);
+                        if let Some(p) = self.pairing.as_mut().filter(|_| on_pairing) {
+                            p.icon = Some(sas.icon);
+                        }
+                        if !on_pairing {
+                            self.mirror.state = "verify";
+                            self.mirror.icon = Some(sas.icon);
+                        }
+                    }
+                    Err(_) => {
+                        session.send(Message::VerifyDone { ok: false });
+                        self.verify = None;
+                        if !on_pairing {
+                            self.end_mirror("The phone's answer didn't check out. Nothing was shared.");
+                        }
+                    }
+                }
+                if on_pairing {
+                    self.emit_net();
+                } else {
+                    self.emit_mirror();
+                }
+            }
+            Message::VerifyResult { ok } => {
+                let shown = self.verify.take().filter(|(s, _)| *s == serial).and_then(|(_, shower)| shower.icon());
+                let ok = *ok && shown.is_some();
+                session.send(Message::VerifyDone { ok });
+                if on_pairing {
+                    self.finish_pairing(ok);
+                } else if ok {
+                    self.mirror.state = "approving";
+                    self.mirror.icon = None;
+                    self.emit_mirror();
+                } else {
+                    self.end_mirror("The icon tapped on the phone wasn't the one shown here. Nothing was shared.");
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn finish_pairing(&mut self, ok: bool) {
+        let Some(pairing) = self.pairing.as_mut() else { return };
+        if ok {
+            let Some(session) = pairing.session.take() else { return };
+            let name = if pairing.phone_name.is_empty() { "Phone".to_string() } else { pairing.phone_name.clone() };
+            self.trust.add(Peer { id: session.id.clone(), name: name.clone(), added: now_ms(), addr: None });
+            net::retire(session);
+            self.close_pairing();
+            self.note(format!("Paired with {name} over the network."));
+        } else {
+            pairing.attempts += 1;
+            pairing.icon = None;
+            if let Some(session) = pairing.session.take() {
+                net::retire(session);
+            }
+            if pairing.attempts >= PAIR_ATTEMPTS {
+                self.close_pairing();
+                self.note("Pairing stopped after too many wrong icons. Start again if that was you.");
+            } else {
+                self.note("That wasn't the icon on this screen. Try again on the phone.");
+                self.emit_net();
+            }
+        }
+    }
+
+    fn emit_mirror(&self) {
+        let m = &self.mirror;
+        self.send_ui(
+            "mirror",
+            json!({
+                "state": if m.state.is_empty() { "idle" } else { m.state },
+                "icon": m.icon.map(|i| pair::ICONS[i].0).unwrap_or(""),
+                "icon_name": m.icon.map(|i| pair::ICONS[i].1).unwrap_or(""),
+                "width": m.width,
+                "height": m.height,
+                "control": m.control,
+                "fps": m.fps,
+                "reason": m.reason,
+                "available": self.net_link.is_some(),
+                "route": self.net_route,
+            }),
+        );
+    }
+
+    fn end_mirror(&mut self, reason: &str) {
+        let was = self.mirror.state;
+        self.mirror = Mirror { state: if was.is_empty() || was == "idle" { "idle" } else { "ended" }, reason: reason.to_string(), ..Default::default() };
+        if self.verify.as_ref().is_some_and(|(s, _)| self.net_link.as_ref().is_some_and(|l| l.serial == *s)) {
+            self.verify = None;
+        }
+        crate::video::clear();
+        self.emit_mirror();
+    }
+
+    /// Input for the phone during a live, verified session.
+    fn to_mirror(&self, message: Message) {
+        if self.mirror.state == "live" && self.mirror.control {
+            if let Some(session) = &self.net_link {
+                session.send(message);
+            }
+        }
     }
 
     fn emit_settings(&self) {
@@ -269,6 +680,13 @@ impl Core {
         }
         if self.config.seen != before {
             self.config.save();
+        }
+    }
+
+    /// Thumbnails for whatever transfers are listed; the demo's start with files.
+    pub fn make_thumbs(&self) {
+        for t in &self.transfers {
+            crate::thumbs::make(t.key.clone(), std::path::PathBuf::from(&t.path), self.tx.clone());
         }
     }
 
@@ -353,6 +771,13 @@ impl Core {
     }
 
     /// Newest first, and only the last fifty.
+    /// Keeps the Files and Clipboard history for next time.
+    fn save_history(&self) {
+        if !self.demo {
+            History::save(&self.transfers, &self.clips);
+        }
+    }
+
     fn add_transfer(&mut self, transfer: Transfer) {
         self.transfers.insert(0, transfer);
         self.transfers.truncate(50);
@@ -362,6 +787,21 @@ impl Core {
     fn route(addrs: Vec<String>, port: u16, key: &str) -> transfer::Route {
         let key = base64::engine::general_purpose::STANDARD.decode(key.as_bytes()).unwrap_or_default();
         transfer::Route { addrs, port, key }
+    }
+
+    fn emit_gallery(&self) {
+        self.send_ui("gallery", json!({ "items": self.gallery, "more": self.gallery_more, "loading": self.gallery_loading }));
+    }
+
+    fn load_gallery(&mut self, more: bool) {
+        if more && (!self.gallery_more || self.gallery_loading) {
+            return;
+        }
+        let before = if more { self.gallery_cursor } else { 0 };
+        if self.to_phone(Message::GetPhotos { limit: 60, before }) {
+            self.gallery_loading = true;
+            self.emit_gallery();
+        }
     }
 
     fn emit_wallpaper(&self) {
@@ -491,9 +931,9 @@ impl Core {
         let (phase, _, _) = self.call_view();
         let summary = json!({
             "running": true,
-            "state": if self.link.is_some() { "connected" } else if self.config.device.is_empty() { "none" } else { "waiting" },
+            "state": if self.connected() { "connected" } else if self.config.device.is_empty() && self.trust.peers.is_empty() { "none" } else { "waiting" },
             "name": self.device().map(|d| d.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| self.peer_name.clone()),
-            "battery": self.status.as_ref().filter(|_| self.link.is_some()).map(|s| s.battery).unwrap_or(-1),
+            "battery": self.status.as_ref().filter(|_| self.connected()).map(|s| s.battery).unwrap_or(-1),
             "charging": self.status.as_ref().is_some_and(|s| s.charging),
             "unread": self.conversations.iter().map(|c| c.unread).sum::<u32>(),
             "notifications": self.notifications.len(),
@@ -555,12 +995,14 @@ impl Core {
         if self.link.take().is_some() {
             self.link_error = reason.to_string();
             self.phone_call = (CallPhase::Idle, String::new(), String::new());
-            // Whatever the phone hadn't answered yet, it won't now.
-            for t in self.transfers.iter_mut().filter(|t| t.state == "waiting") {
+            // Whatever the phone hadn't answered yet, it won't now. Files on
+            // the network carry on without Bluetooth.
+            for t in self.transfers.iter_mut().filter(|t| t.state == "waiting" && t.via != "network") {
                 t.state = "failed";
                 t.error = "The phone disconnected.".into();
             }
             self.send_ui("transfers", json!(self.transfers));
+            self.save_history();
         }
         self.connecting = None;
         self.emit_link();
@@ -635,6 +1077,9 @@ impl Core {
                         .map(String::from)
                         .to_vec(),
                 });
+                if let (Some(node), true) = (&self.node, self.pairing.is_some()) {
+                    link.send(Message::NetInvite { id: node.id(), name: hostname() });
+                }
                 self.link = Some(link);
                 self.connecting = None;
                 self.backoff = 0;
@@ -682,7 +1127,7 @@ impl Core {
                     return;
                 }
                 self.last_clip = text.clone();
-                if self.config.clipboard && self.link.is_some() {
+                if self.config.clipboard && self.connected() {
                     self.push_clip(&text, "desktop");
                     self.to_phone(Message::Clipboard { text });
                 }
@@ -704,7 +1149,7 @@ impl Core {
             Event::ToastClosed { id, by_user } => {
                 if let Some(key) = self.toasts.iter().find(|(_, v)| **v == id).map(|(k, _)| k.clone()) {
                     self.toasts.remove(&key);
-                    if by_user && self.link.is_some() {
+                    if by_user && self.connected() {
                         self.to_phone(Message::DismissNotification { key });
                     }
                 }
@@ -712,6 +1157,17 @@ impl Core {
 
             Event::TransferProgress { key, done } => {
                 if let Some(t) = self.transfers.iter_mut().find(|t| t.key == key) {
+                    // Smoothed, so the figure doesn't jump with every report.
+                    let now = Instant::now();
+                    if let Some((then, before)) = t.sample {
+                        let seconds = now.duration_since(then).as_secs_f64();
+                        if seconds > 0.05 && done > before {
+                            let fresh = (done - before) as f64 / seconds;
+                            t.speed = if t.speed > 0.0 { t.speed * 0.6 + fresh * 0.4 } else { fresh };
+                        }
+                    }
+                    t.sample = Some((now, done));
+                    t.eta = if t.speed > 0.0 && t.size > 0 { ((t.size as f64 - done as f64).max(0.0) / t.speed).round() as i64 } else { -1 };
                     t.done = done;
                     self.send_ui("transfers", json!(self.transfers));
                 }
@@ -728,8 +1184,16 @@ impl Core {
                     None if t.incoming => t.state = "done",
                     None => {}
                 }
+                if t.state == "done" || t.state == "failed" {
+                    t.speed = 0.0;
+                    t.eta = -1;
+                }
+                if t.incoming && t.state == "done" {
+                    crate::thumbs::make(t.key.clone(), std::path::PathBuf::from(&t.path), self.tx.clone());
+                }
                 let arrived = (t.incoming && t.state == "done").then(|| t.name.clone());
                 self.send_ui("transfers", json!(self.transfers));
+                self.save_history();
                 if let (Some(name), Some(session), true) = (arrived, self.session.clone(), self.config.toasts) {
                     let toast = Toast {
                         replaces: 0,
@@ -743,8 +1207,161 @@ impl Core {
                     desktop::notify(&session, toast).await;
                 }
             }
+            Event::NetReady(node) => {
+                self.node = Some(node);
+                self.net_state = "ready";
+                self.net_error.clear();
+                self.emit_net();
+            }
+            Event::NetFailed(error) => {
+                self.net_state = "failed";
+                self.net_error = error;
+                self.emit_net();
+            }
+            Event::NetIncoming { alpn, conn } => {
+                let id = omalink_net::remote(&conn);
+                if omalink_net::is_pair(&alpn) {
+                    // Only while pairing is open, and one phone at a time.
+                    match self.pairing.as_mut() {
+                        Some(p) if p.session.is_none() => {
+                            p.session = Some(net::open(conn, true, self.tx.clone()));
+                            p.phone_name.clear();
+                            p.icon = None;
+                            self.emit_net();
+                        }
+                        _ => conn.close(1u32.into(), b"not pairing"),
+                    }
+                } else if omalink_net::is_link(&alpn) && self.trust.contains(&id) {
+                    // A phone reconnecting replaces its old connection.
+                    let had_bluetooth = self.link.is_some();
+                    self.net_link = Some(net::open(conn, false, self.tx.clone()));
+                    self.net_route = "connecting".into();
+                    if let Some(session) = &self.net_link {
+                        session.send(Message::Hello { version: PROTOCOL_VERSION, name: hostname() });
+                        if !had_bluetooth {
+                            session.send(Message::Sync {
+                                what: ["status", "permissions", "notifications", "conversations", "call_log", "contacts", "wallpaper"]
+                                    .map(String::from)
+                                    .to_vec(),
+                            });
+                        }
+                    }
+                    self.link_error.clear();
+                    self.emit_net();
+                    self.emit_link();
+                    self.emit_mirror();
+                } else {
+                    conn.close(1u32.into(), b"not trusted");
+                }
+            }
+            Event::NetDown { serial, reason } => {
+                if self.pairing.as_ref().and_then(|p| p.session.as_ref()).is_some_and(|s| s.serial == serial) {
+                    if let Some(p) = self.pairing.as_mut() {
+                        p.session = None;
+                        p.icon = None;
+                    }
+                    if self.verify.as_ref().is_some_and(|(s, _)| *s == serial) {
+                        self.verify = None;
+                    }
+                    self.emit_net();
+                } else if self.net_link.as_ref().is_some_and(|s| s.serial == serial) {
+                    self.net_link = None;
+                    self.net_route.clear();
+                    if !matches!(self.mirror.state, "" | "idle" | "ended") {
+                        self.end_mirror("The connection to the phone was lost.");
+                    }
+                    if self.verify.as_ref().is_some_and(|(s, _)| *s == serial) {
+                        self.verify = None;
+                    }
+                    for t in self.transfers.iter_mut().filter(|t| t.via == "network" && (t.state == "waiting" || t.state == "active")) {
+                        t.state = "failed";
+                        t.error = reason.clone();
+                    }
+                    self.send_ui("transfers", json!(self.transfers));
+                    self.save_history();
+                    if self.link.is_none() {
+                        self.link_error = reason;
+                    }
+                    self.emit_net();
+                    self.emit_link();
+                    self.emit_mirror();
+                }
+            }
+            Event::NetPeer { serial, message } => {
+                if self.handle_verify(serial, &message) {
+                    return;
+                }
+                let on_pairing = self.pairing.as_ref().and_then(|p| p.session.as_ref()).is_some_and(|s| s.serial == serial);
+                if on_pairing {
+                    if let (Message::Hello { name, .. }, Some(p)) = (&message, self.pairing.as_mut()) {
+                        p.phone_name = name.clone();
+                        self.emit_net();
+                    }
+                } else if self.net_link.as_ref().is_some_and(|s| s.serial == serial) {
+                    self.handle_peer(message).await;
+                }
+            }
+            Event::NetRoute { serial, route } => {
+                if self.net_link.as_ref().is_some_and(|s| s.serial == serial) {
+                    self.net_route = route;
+                    self.emit_net();
+                }
+            }
+            Event::NetFileIncoming(transfer) => self.add_transfer(transfer),
+            Event::MirrorLive { serial, width, height } => {
+                if self.net_link.as_ref().is_some_and(|s| s.serial == serial) && self.mirror.state != "idle" {
+                    self.mirror.state = "live";
+                    self.mirror.width = width;
+                    self.mirror.height = height;
+                    self.mirror.reason.clear();
+                    self.emit_mirror();
+                    // Development builds can capture the live page, as the demo does.
+                    #[cfg(debug_assertions)]
+                    if let Ok(path) = std::env::var("OMALINK_SHOT") {
+                        self.send_ui("shot", json!({ "path": path, "page": 7, "delay": 3000 }));
+                    }
+                }
+            }
+            Event::MirrorFps { serial, fps } => {
+                if self.net_link.as_ref().is_some_and(|s| s.serial == serial) && self.mirror.state == "live" {
+                    #[cfg(debug_assertions)]
+                    eprintln!("omalink: mirroring {}x{} at {fps} fps", self.mirror.width, self.mirror.height);
+                    self.mirror.fps = fps;
+                    self.emit_mirror();
+                }
+            }
+            Event::MirrorKeyframe { serial } => {
+                if let Some(session) = self.net_link.as_ref().filter(|s| s.serial == serial) {
+                    session.send(Message::KeyframeRequest);
+                }
+            }
+            // A turned phone ends one stream and starts another at the new size.
+            Event::MirrorStreamEnd { serial } => {
+                if self.net_link.as_ref().is_some_and(|s| s.serial == serial) && self.mirror.state == "live" {
+                    self.mirror.state = "approving";
+                    self.emit_mirror();
+                }
+            }
+            Event::MirrorFailed { serial, reason } => {
+                if self.net_link.as_ref().is_some_and(|s| s.serial == serial) {
+                    if let Some(session) = &self.net_link {
+                        session.send(Message::MirrorStop);
+                    }
+                    self.end_mirror(&reason);
+                }
+            }
+
+            Event::Thumb { key, path } => {
+                if let Some(t) = self.transfers.iter_mut().find(|t| t.key == key) {
+                    t.thumb = format!("file://{path}");
+                    self.send_ui("transfers", json!(self.transfers));
+                }
+            }
             Event::Tick => {
                 self.ticks += 1;
+                if self.pairing.as_ref().is_some_and(|p| Instant::now() >= p.until) {
+                    self.close_pairing();
+                }
                 if self.link.is_some() {
                     if self.last_heard.elapsed() > Duration::from_secs(45) {
                         self.drop_link("The phone stopped responding.");
@@ -775,6 +1392,7 @@ impl Core {
         self.clips.insert(0, Clip { text: text.to_string(), time: now_ms(), from });
         self.clips.truncate(30);
         self.send_ui("clips", json!(self.clips));
+        self.save_history();
     }
 
     async fn handle_peer(&mut self, message: Message) {
@@ -917,6 +1535,7 @@ impl Core {
             }
             Message::FileOffer { id, name, size, port, addrs, key } => {
                 let dest = transfer::destination(&name);
+                let name_for_kind = name.clone();
                 self.add_transfer(Transfer {
                     key: transfer::key(true, id),
                     name: dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(name),
@@ -927,6 +1546,10 @@ impl Core {
                     error: String::new(),
                     path: dest.to_string_lossy().into_owned(),
                     time: now_ms(),
+                    via: "bluetooth",
+                    kind: crate::thumbs::kind(&name_for_kind),
+                    eta: -1,
+                    ..Default::default()
                 });
                 tokio::spawn(transfer::download(Self::route(addrs, port, &key), dest, id, self.tx.clone()));
             }
@@ -951,6 +1574,37 @@ impl Core {
                         t.error = error;
                     }
                     self.send_ui("transfers", json!(self.transfers));
+                    self.save_history();
+                }
+            }
+            Message::Photos { items, more, cursor, before } => {
+                let dir = self.phone_cache().join("gallery");
+                let items: Vec<PhoneMedia> = items
+                    .into_iter()
+                    .map(|mut m| {
+                        let path = dir.join(format!("{}.jpg", m.id));
+                        if !m.thumb.is_empty() && (path.exists() || Self::store_image(&path, &m.thumb)) {
+                            m.thumb = format!("file://{}", path.display());
+                        } else {
+                            m.thumb.clear();
+                        }
+                        m
+                    })
+                    .collect();
+                if before == 0 {
+                    self.gallery = items;
+                } else {
+                    let known: std::collections::HashSet<i64> = self.gallery.iter().map(|m| m.id).collect();
+                    self.gallery.extend(items.into_iter().filter(|m| !known.contains(&m.id)));
+                }
+                self.gallery_more = more;
+                self.gallery_cursor = cursor;
+                self.gallery_loading = false;
+                self.emit_gallery();
+            }
+            Message::PhotosChanged => {
+                if !self.gallery.is_empty() {
+                    self.load_gallery(false);
                 }
             }
             Message::Wallpaper { image } => {
@@ -972,6 +1626,20 @@ impl Core {
             }
             Message::Failed { what, reason } => {
                 self.note(if reason.is_empty() { format!("The phone couldn't do that ({what}).") } else { reason });
+            }
+            Message::MirrorEnded { reason } => {
+                if !matches!(self.mirror.state, "" | "idle") {
+                    self.end_mirror(if reason.is_empty() { "The phone stopped sharing its screen." } else { &reason });
+                }
+            }
+            Message::MirrorStop => {
+                if !matches!(self.mirror.state, "" | "idle") {
+                    self.end_mirror("The phone stopped sharing its screen.");
+                }
+            }
+            Message::ControlState { available } => {
+                self.mirror.control = available;
+                self.emit_mirror();
             }
             // Things only a desktop says; a phone that sends them is confused.
             _ => {}
@@ -1054,7 +1722,88 @@ impl Core {
                 self.emit_link();
             }
             "connect_calls" => self.connect_calls(),
-            "show" => self.send_ui("show", json!({})),
+            "mirror_start" => {
+                let Some(session) = &self.net_link else {
+                    return self.note("Screen sharing needs the phone paired over the network. Pair it on the Phone page.");
+                };
+                session.send(Message::MirrorRequest { max_size: 1600 });
+                self.mirror = Mirror { state: "requested", ..Default::default() };
+                self.emit_mirror();
+            }
+            "mirror_stop" => {
+                if let Some(session) = &self.net_link {
+                    session.send(Message::MirrorStop);
+                }
+                self.end_mirror("");
+                self.mirror.state = "idle";
+                self.emit_mirror();
+            }
+            "mirror_input" => {
+                let kind = match arg_str(args, "kind").as_str() {
+                    "down" => InputKind::Down,
+                    "move" => InputKind::Move,
+                    "up" => InputKind::Up,
+                    _ => return,
+                };
+                let at = |key: &str| args.get(key).and_then(Json::as_f64).unwrap_or(0.0).clamp(0.0, 1.0) as f32;
+                self.to_mirror(Message::Input { kind, x: at("x"), y: at("y") });
+            }
+            "mirror_scroll" => {
+                let at = |key: &str| args.get(key).and_then(Json::as_f64).unwrap_or(0.0) as f32;
+                self.to_mirror(Message::Scroll { x: at("x").clamp(0.0, 1.0), y: at("y").clamp(0.0, 1.0), dx: at("dx").clamp(-10.0, 10.0), dy: at("dy").clamp(-10.0, 10.0) });
+            }
+            "mirror_action" => {
+                let action = arg_str(args, "action");
+                if matches!(action.as_str(), "back" | "home" | "recents" | "notifications" | "lock") {
+                    self.to_mirror(Message::GlobalAction { action });
+                }
+            }
+            "mirror_text" => {
+                let text = arg_str(args, "text");
+                if !text.is_empty() {
+                    self.to_mirror(Message::TypeText { text });
+                }
+            }
+            "mirror_key" => {
+                let key = arg_str(args, "key");
+                if matches!(key.as_str(), "enter" | "backspace" | "delete" | "left" | "right") {
+                    self.to_mirror(Message::Key { key });
+                }
+            }
+            "net_pair" => {
+                if arg_bool(args, "on") {
+                    self.open_pairing();
+                } else {
+                    self.close_pairing();
+                }
+            }
+            "net_forget" => {
+                let id = arg_str(args, "id");
+                if self.trust.remove(&id) && self.net_link.as_ref().is_some_and(|s| s.id == id) {
+                    self.net_link = None;
+                    self.emit_link();
+                }
+                self.emit_net();
+            }
+            "net_relay" => {
+                let relay = arg_str(args, "url").trim().to_string();
+                if let Err(e) = omalink_net::relay_mode(&relay) {
+                    return self.note(e);
+                }
+                self.config.relay = relay;
+                self.config.save();
+                // A relay is chosen when the node starts, so start it again.
+                self.net_link = None;
+                self.close_pairing();
+                if let Some(node) = self.node.take() {
+                    tokio::spawn(async move { node.close().await });
+                }
+                self.net_state = "starting";
+                self.emit_net();
+                self.emit_link();
+                net::start(self.config.relay.clone(), self.tx.clone());
+            }
+            "show" => self.send_ui("show", json!({ "page": arg_str(args, "page") })),
             // The window is about to quit: say so, for whoever reads the status.
             "bye" => {
                 let _ = std::fs::write(Self::status_path(), json!({ "running": false }).to_string());
@@ -1085,7 +1834,7 @@ impl Core {
                     self.apply_seen(Some(thread_id), false);
                     self.send_ui("conversations", json!(self.conversations));
                 }
-                if self.link.is_some() {
+                if self.connected() {
                     self.to_phone(Message::GetMessages { thread_id, limit: 200 });
                     self.to_phone(Message::MarkRead { thread_id });
                 }
@@ -1188,22 +1937,41 @@ impl Core {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     self.transfer_id += 1;
                     let id = self.transfer_id;
-                    if !self.to_phone(Message::SendFile { id, name: name.clone(), size: size as i64 }) {
+                    // The network link carries files itself; Bluetooth only arranges them.
+                    let via = if let Some(session) = &self.net_link {
+                        net::upload(session.conn.clone(), id, path.clone(), size as i64, self.tx.clone());
+                        "network"
+                    } else if self.to_phone(Message::SendFile { id, name: name.clone(), size: size as i64 }) {
+                        "bluetooth"
+                    } else {
                         break;
-                    }
+                    };
                     self.add_transfer(Transfer {
                         key: transfer::key(false, id),
                         name,
                         size: size as i64,
                         done: 0,
                         incoming: false,
-                        state: "waiting",
+                        state: if via == "network" { "active" } else { "waiting" },
                         error: String::new(),
                         path: path.to_string_lossy().into_owned(),
                         time: now_ms(),
+                        via,
+                        kind: crate::thumbs::kind(&path.to_string_lossy()),
+                        eta: -1,
+                        ..Default::default()
                     });
+                    crate::thumbs::make(transfer::key(false, id), path.clone(), self.tx.clone());
                 }
             }
+            // Ctrl+V on the Files page: send what was copied, a file or an image.
+            "paste_send" => match desktop::clipboard_files().await {
+                Ok(paths) => {
+                    let paths: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+                    Box::pin(self.handle_ui("send_files", &json!({ "paths": paths }))).await;
+                }
+                Err(e) => self.note(e),
+            },
             "open_path" | "show_path" => {
                 // Only files this app put there or was given, not any path.
                 let path = arg_str(args, "path");
@@ -1219,6 +1987,27 @@ impl Core {
             "clear_transfers" => {
                 self.transfers.retain(|t| t.state == "waiting" || t.state == "active");
                 self.send_ui("transfers", json!(self.transfers));
+                self.save_history();
+            }
+            "gallery_load" => self.load_gallery(arg_bool(args, "more")),
+            "gallery_get" => {
+                let ids: Vec<i64> = args.get("ids").and_then(Json::as_array).map(|a| a.iter().filter_map(Json::as_i64).collect()).unwrap_or_default();
+                for id in ids.iter().take(200) {
+                    self.to_phone(Message::GetPhoto { id: *id });
+                }
+                if !ids.is_empty() && self.connected() {
+                    self.note(if ids.len() == 1 { "Downloading from your phone…".to_string() } else { format!("Downloading {} items from your phone…", ids.len()) });
+                }
+            }
+            "gallery_delete" => {
+                let ids: Vec<i64> = args.get("ids").and_then(Json::as_array).map(|a| a.iter().filter_map(Json::as_i64).collect()).unwrap_or_default();
+                if !ids.is_empty() && self.to_phone(Message::DeletePhotos { ids: ids.clone() }) {
+                    // Gone from here at once; the phone catches up once it's
+                    // confirmed there. Cancelled ones come back on the next refresh.
+                    self.gallery.retain(|m| !ids.contains(&m.id));
+                    self.emit_gallery();
+                    self.note("Confirm on your phone to delete.");
+                }
             }
             "find_phone" => {
                 self.to_phone(Message::FindPhone);
@@ -1275,6 +2064,18 @@ impl Instance {
     async fn send(&self, paths: Vec<String>) {
         let _ = self.tx.send(Event::Ui("send_files".into(), json!({ "paths": paths })));
     }
+
+    /// Starts sharing the phone's screen, for scripts and keybindings.
+    async fn mirror(&self) {
+        let _ = self.tx.send(Event::Ui("mirror_start".into(), Json::Null));
+        let _ = self.tx.send(Event::Ui("show".into(), json!({ "page": "screen" })));
+    }
+
+    /// Opens pairing over the network, for scripts and keybindings.
+    async fn pair(&self) {
+        let _ = self.tx.send(Event::Ui("net_pair".into(), json!({ "on": true })));
+        let _ = self.tx.send(Event::Ui("show".into(), Json::Null));
+    }
 }
 
 pub async fn run(emit: Emit, tx: UnboundedSender<Event>, mut rx: UnboundedReceiver<Event>, demo: bool, background: bool) {
@@ -1320,7 +2121,27 @@ pub async fn run(emit: Emit, tx: UnboundedSender<Event>, mut rx: UnboundedReceiv
         // Not from zero, so a restart can't reuse an id the phone still holds.
         transfer_id: now_ms() as u64,
         published: String::new(),
+        node: None,
+        net_state: if demo { "off" } else { "starting" },
+        net_error: String::new(),
+        trust: if demo { Trust::default() } else { Trust::load(net::trust_path()) },
+        net_link: None,
+        net_route: String::new(),
+        pairing: None,
+        verify: None,
+        mirror: Mirror::default(),
+        gallery: Vec::new(),
+        gallery_cursor: 0,
+        gallery_more: false,
+        gallery_loading: false,
     };
+
+    if !demo {
+        let (transfers, clips) = History::load();
+        core.transfers = transfers;
+        core.clips = clips;
+        core.make_thumbs();
+    }
 
     tokio::spawn(desktop::watch_theme(tx.clone()));
 
@@ -1361,6 +2182,7 @@ pub async fn run(emit: Emit, tx: UnboundedSender<Event>, mut rx: UnboundedReceiv
             Err(e) => core.note(format!("Couldn't reach the system bus: {e}")),
         }
         tokio::spawn(desktop::watch_clipboard(tx.clone()));
+        net::start(core.config.relay.clone(), tx.clone());
         let ticker = tx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(3));
@@ -1373,6 +2195,8 @@ pub async fn run(emit: Emit, tx: UnboundedSender<Event>, mut rx: UnboundedReceiv
         });
         core.emit_settings();
         core.emit_link();
+        core.emit_net();
+        core.emit_mirror();
         core.emit_phone();
         core.send_ui("ready", json!({ "show": !background }));
     }

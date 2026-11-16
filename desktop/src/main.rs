@@ -7,8 +7,11 @@ mod core;
 mod demo;
 mod desktop;
 mod link;
+mod net;
 mod telephony;
+mod thumbs;
 mod transfer;
+mod video;
 
 use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QQuickStyle, QString, QUrl};
 
@@ -52,6 +55,14 @@ fn main() {
         }
     }
     let _ = OPTIONS.set(options);
+
+    // RUST_LOG=iroh=debug (for one) shows how the network link finds the phone.
+    if std::env::var_os("RUST_LOG").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
 
     // Must happen before the application exists; see glshare.cpp.
     unsafe { omalink_share_gl_contexts() };

@@ -4,7 +4,7 @@
 use omalink_proto::{CallEntry, CallKind, Contact, Conversation, Notification, PhoneStatus, Sms};
 use serde_json::{json, Value as Json};
 
-use crate::core::{now_ms, Clip, Core};
+use crate::core::{now_ms, Clip, Core, Transfer};
 
 const MINUTE: i64 = 60_000;
 const HOUR: i64 = 60 * MINUTE;
@@ -50,7 +50,7 @@ fn thread(id: i64) -> Vec<Sms> {
 pub fn seed(core: &mut Core) {
     let now = now_ms();
     core.status = Some(PhoneStatus { battery: 78, charging: false, signal: 3, carrier: "Northwind".into(), ringer: "normal".into() });
-    core.granted = ["bluetooth", "post_notifications", "notifications", "sms", "contacts", "call_log", "phone"].map(String::from).to_vec();
+    core.granted = ["bluetooth", "post_notifications", "notifications", "sms", "contacts", "call_log", "phone", "photos"].map(String::from).to_vec();
     core.missing = vec!["battery".into()];
     let conversation = |thread_id, name: &str, address: &str, snippet: &str, ago, unread| Conversation {
         thread_id,
@@ -125,20 +125,46 @@ pub fn seed(core: &mut Core) {
     core.send_ui("link", json!({ "state": "connected", "address": "00:00:00:00:00:01", "name": "Pixel 9", "error": "", "calls": true }));
     core.send_ui("call", json!({ "phase": "idle", "number": "", "name": "", "since": 0, "audio": false, "muted": false }));
     core.emit_phone();
+    let net = |pairing: Json| {
+        json!({
+            "state": "ready", "error": "", "id": "demo", "name": "omarchy", "connected": true, "route": "direct", "relay": "",
+            "phones": [{ "id": "demo-phone", "name": "Pixel 9", "added": now_ms() - 86_400_000, "connected": true }],
+            "pairing": pairing,
+        })
+    };
+    core.send_ui("net", net(Json::Null));
+    seed_files(core);
+    let mirror = |state: &str, icon: &str, name: &str| {
+        json!({ "state": state, "icon": icon, "icon_name": name, "width": 0, "height": 0, "control": true, "fps": 0, "reason": "", "available": true, "route": "direct" })
+    };
+    core.send_ui("mirror", mirror("idle", "", ""));
 
     // For screenshots: OMALINK_SHOT=/path/to.png[:page[:call[:delay_ms]]] renders one
     // page to a file and exits, without needing a display.
     if let Ok(shot) = std::env::var("OMALINK_SHOT") {
         let mut parts = shot.split(':');
         let path = parts.next().unwrap_or_default();
-        let page = parts.next().and_then(|p| p.parse::<i64>().ok()).unwrap_or(0);
+        // A page by number or by name ("home", "files", …).
+        let page = match parts.next() {
+            Some(p) => p.parse::<i64>().map(Json::from).unwrap_or_else(|_| Json::from(p)),
+            None => Json::from(0),
+        };
         match parts.next() {
             Some("incoming") => core.send_ui("call", json!({ "phase": "incoming", "number": "+1 555 010 4477", "name": "Maya Lindqvist", "since": 0, "audio": true, "muted": false })),
             Some("active") => core.send_ui("call", json!({ "phase": "active", "number": "+1 555 010 4477", "name": "Maya Lindqvist", "since": now_ms() - 83_000, "audio": true, "muted": false })),
+            Some("drop") => core.send_ui("demo_drop", json!(true)),
+            Some("gallery") => core.send_ui("demo_tab", json!("phone")),
+            Some("mirror-verify") => core.send_ui("mirror", mirror("verify", "🐙", "octopus")),
+            Some("pairing") => core.send_ui("net", net(json!({ "phone": "Pixel 9", "icon": "🦊", "icon_name": "fox", "attempts": 0, "left": 3 }))),
             _ => {}
         }
         let delay = parts.next().and_then(|p| p.parse::<i64>().ok()).unwrap_or(900);
-        core.send_ui("shot", json!({ "path": path, "page": page, "delay": delay }));
+        // OMALINK_SHOT_SIZE=1900x1100 renders at that window size.
+        let (width, height) = std::env::var("OMALINK_SHOT_SIZE")
+            .ok()
+            .and_then(|s| s.split_once('x').and_then(|(w, h)| Some((w.parse::<i64>().ok()?, h.parse::<i64>().ok()?))))
+            .unwrap_or((0, 0));
+        core.send_ui("shot", json!({ "path": path, "page": page, "delay": delay, "width": width, "height": height }));
     }
 }
 
@@ -178,4 +204,68 @@ pub fn handle(core: &mut Core, name: &str, args: &Json) -> bool {
         _ => {}
     }
     true
+}
+
+/// Files for the Files page: Omarchy's own theme pictures and intro videos
+/// where they exist, so the previews are real, and a few documents.
+fn seed_files(core: &mut Core) {
+    let themes = std::path::Path::new("/usr/share/omarchy/themes");
+    let mut media: Vec<std::path::PathBuf> = ["catppuccin/backgrounds/1-totoro.webp", "ethereal/backgrounds/2-meadow.webp", "catppuccin/backgrounds/intros/2-waves.mp4",
+        "catppuccin/backgrounds/3-blue-eye.webp", "everforest/backgrounds/intros/1-tree-tops.mp4", "ethereal/backgrounds/1-cosmic.webp"]
+        .iter()
+        .map(|p| themes.join(p))
+        .collect();
+    media.retain(|p| p.exists());
+    let now = now_ms();
+    let mut files: Vec<Transfer> = Vec::new();
+    let mut add = |name: String, path: String, size: i64, incoming: bool, state: &'static str, minutes: i64| {
+        let key = format!("demo{}", files.len());
+        files.push(Transfer {
+            key,
+            kind: crate::thumbs::kind(&name),
+            name,
+            size,
+            done: if state == "active" { (size as f64 * 0.42) as u64 } else { size.max(0) as u64 },
+            incoming,
+            state,
+            path,
+            time: now - minutes * 60_000,
+            via: "network",
+            speed: if state == "active" { 3_400_000.0 } else { 0.0 },
+            eta: if state == "active" { 7 } else { -1 },
+            ..Default::default()
+        });
+    };
+    for (i, path) in media.iter().enumerate() {
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let size = std::fs::metadata(path).map(|m| m.len() as i64).unwrap_or(0);
+        add(name, path.to_string_lossy().into_owned(), size, i % 3 != 1, if i == 0 { "active" } else { "done" }, i as i64 * 7);
+    }
+    add("Lease agreement.pdf".into(), "/nonexistent/Lease agreement.pdf".into(), 1_284_000, true, "done", 55);
+    add("omalink.apk".into(), "/nonexistent/omalink.apk".into(), 11_201_439, false, "done", 80);
+    add("Holiday plans.zip".into(), "/nonexistent/Holiday plans.zip".into(), 48_000_000, false, "failed", 95);
+    add("Voice note.m4a".into(), "/nonexistent/Voice note.m4a".into(), 820_000, true, "done", 130);
+    if let Some(failed) = files.iter_mut().find(|t| t.state == "failed") {
+        failed.error = "The connection to the phone was lost.".into();
+    }
+    core.transfers = files;
+    // A wallpaper for the phone, from the same place.
+    let wallpaper = themes.join("ethereal/backgrounds/1-cosmic.webp");
+    if wallpaper.exists() {
+        core.send_ui("wallpaper", json!(format!("file://{}", wallpaper.display())));
+    }
+    core.send_ui("transfers", json!(core.transfers));
+    // A gallery made of the same pictures, a few days' worth.
+    let gallery: Vec<Json> = (0..18)
+        .filter_map(|i| {
+            let path = media.get(i % media.len().max(1))?;
+            let video = path.extension().is_some_and(|e| e == "mp4");
+            let thumb = if video { String::new() } else { format!("file://{}", path.display()) };
+            Some(json!({ "id": i, "name": format!("IMG_{i:04}"), "kind": if video { "video" } else { "image" },
+                         "time": now - (i as i64 / 6) * 86_400_000 - i as i64 * 600_000, "size": 2_400_000,
+                         "width": 1080, "height": 1920, "duration_ms": if video { 14_000 } else { 0 }, "thumb": thumb }))
+        })
+        .collect();
+    core.send_ui("gallery", json!({ "items": gallery, "more": false, "loading": false }));
+    core.make_thumbs();
 }

@@ -17,6 +17,9 @@ futures-util = { version = "0.3", default-features = false }
 libc = "0.2"
 base64 = "0.22"
 aes-gcm = "0.10"
+omalink-net = { path = "../crates/net" }
+openh264 = "0.9.10"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [build-dependencies]
 cxx-qt-build = "0.10"

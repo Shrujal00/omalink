@@ -22,6 +22,25 @@ class ShareActivity : Activity() {
     }
 
     private var done = false
+    private var drop: Omadrop? = null
+
+    override fun onDestroy() {
+        LinkService.instance?.transfers?.let { if (it.watcher === drop) it.watcher = null }
+        super.onDestroy()
+    }
+
+    @Deprecated("Back closes the sheet with its animation.")
+    override fun onBackPressed() {
+        drop?.close() ?: super.onBackPressed()
+    }
+
+    private fun computerName() = LinkService.instance?.peer?.ifEmpty { null } ?: "Your computer"
+
+    private fun sheet(): Omadrop = Omadrop(this) {
+        finish()
+        @Suppress("DEPRECATION")
+        overridePendingTransition(0, 0)
+    }.also { drop = it }
 
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
@@ -38,21 +57,15 @@ class ShareActivity : Activity() {
         }
     }
 
+    /** Omadrop: the sheet follows the files until they've landed. */
     private fun sendFiles(files: List<Uri>) {
         done = true
         val service = LinkService.instance
-        var sent = 0
-        if (service != null && service.connected) {
-            for (uri in files) if (service.transfers.offer(this, uri)) sent++
-        }
-        val message = when {
-            service == null || !service.connected -> "Your computer isn't connected"
-            sent == 0 -> "Nothing that can be sent"
-            sent == 1 -> "Sending to your computer…"
-            else -> "Sending $sent files to your computer…"
-        }
-        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
-        finish()
+        val connected = service != null && service.connected && files.isNotEmpty()
+        val drop = sheet()
+        if (connected) service!!.transfers.watcher = drop
+        drop.show(files, computerName(), connected)
+        if (connected) for (uri in files) service!!.transfers.offer(this, uri)
     }
 
     override fun onWindowFocusChanged(focused: Boolean) {
@@ -68,15 +81,12 @@ class ShareActivity : Activity() {
     private fun deliver(text: String?) {
         done = true
         val service = LinkService.instance
-        val message = when {
-            text.isNullOrEmpty() -> "Nothing to send"
-            service == null || !service.connected -> "Your computer isn't connected"
-            else -> {
-                service.sendClipboard(text)
-                "Sent to your computer"
-            }
+        if (text.isNullOrEmpty()) {
+            Toast.makeText(this, "Nothing to send", Toast.LENGTH_SHORT).show()
+            return finish()
         }
-        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
-        finish()
+        val connected = service != null && service.connected
+        if (connected) service!!.sendClipboard(text!!)
+        sheet().showText(computerName(), connected)
     }
 }

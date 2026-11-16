@@ -48,16 +48,15 @@ class LinkService : Service() {
     companion object {
         private const val TAG = "Omalink"
         private const val CHANNEL = "link"
-        private const val ASK_CHANNEL = "ask"
+        const val ASK_CHANNEL = "ask"
         private const val SMS_SENT = "io.omalink.SMS_SENT"
         const val EXTRA_REQUEST = "request"
 
         @Volatile var instance: LinkService? = null
 
         fun start(context: Context) {
-            // Without the Bluetooth permission there is nothing to listen on,
-            // and Android refuses this kind of foreground service anyway.
-            if (!Perms.granted(context, Perms.BLUETOOTH)) return
+            // Runs without Bluetooth too: the network link needs no
+            // permission the user has to give.
             try {
                 context.startForegroundService(Intent(context, LinkService::class.java))
             } catch (e: Exception) {
@@ -68,15 +67,19 @@ class LinkService : Service() {
 
     lateinit var data: PhoneData
     val transfers = Transfers(this)
+    val photos = Photos(this)
     private val main = Handler(Looper.getMainLooper())
     private val outbox = LinkedBlockingQueue<ByteArray>()
     @Volatile private var running = false
     @Volatile private var server: BluetoothServerSocket? = null
     @Volatile private var socket: BluetoothSocket? = null
-    @Volatile var connected = false
+    /** The Bluetooth channel is open. */
+    @Volatile var bluetooth = false
         private set
-    @Volatile var peer = ""
-        private set
+    @Volatile private var bluetoothPeer = ""
+    /** The computer can be talked to, over Bluetooth or the network. */
+    val connected get() = bluetooth || Net.connected
+    val peer get() = if (bluetooth) bluetoothPeer else Net.peer
     private var ringtone: Ringtone? = null
     private var lastStatus = ""
     private var callNumber = ""
@@ -106,6 +109,7 @@ class LinkService : Service() {
         }
         running = true
         Thread(::acceptLoop, "omalink-accept").start()
+        Net.start(this)
         watch()
     }
 
@@ -119,6 +123,7 @@ class LinkService : Service() {
         try { unregisterReceiver(receiver) } catch (e: Exception) { }
         contentResolver.unregisterContentObserver(smsObserver)
         contentResolver.unregisterContentObserver(callObserver)
+        contentResolver.unregisterContentObserver(photos.observer)
         super.onDestroy()
     }
 
@@ -132,10 +137,29 @@ class LinkService : Service() {
         val builder = Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_link)
             .setContentTitle(if (connected) "Connected to ${peer.ifEmpty { "your computer" }}" else "Waiting for your computer")
+            .setContentText(if (!bluetooth && Net.connected) (if (Net.route == "relay") "Over the internet, through a relay" else "Over the network") else null)
             .setContentIntent(open)
             .setOngoing(true)
         if (connected) builder.addAction(Notification.Action.Builder(null, "Send clipboard", clip).build())
         return builder.build()
+    }
+
+    /** The network link came, went, or changed path. */
+    fun linkChanged() {
+        if (Net.connected && !bluetooth) {
+            NotifListener.instance?.forgetIcons()
+            lastStatus = ""
+        }
+        refresh()
+    }
+
+    /** A message from the computer, from either link. */
+    fun received(request: JSONObject, fromNetwork: Boolean) {
+        try {
+            handle(request)
+        } catch (e: Exception) {
+            Log.w(TAG, "request${if (fromNetwork) " (network)" else ""} failed: $e")
+        }
     }
 
     private fun refresh() {
@@ -173,8 +197,8 @@ class LinkService : Service() {
     private fun serve(accepted: BluetoothSocket) {
         socket = accepted
         outbox.clear()
-        connected = true
-        peer = try { accepted.remoteDevice?.name ?: "" } catch (e: SecurityException) { "" }
+        bluetooth = true
+        bluetoothPeer = try { accepted.remoteDevice?.name ?: "" } catch (e: SecurityException) { "" }
         NotifListener.instance?.forgetIcons()
         lastStatus = ""
         refresh()
@@ -182,7 +206,7 @@ class LinkService : Service() {
         val writer = Thread({
             try {
                 val out = accepted.outputStream
-                while (connected) {
+                while (bluetooth) {
                     out.write(outbox.take())
                     if (outbox.isEmpty()) out.flush()
                 }
@@ -198,17 +222,11 @@ class LinkService : Service() {
         try {
             val input = accepted.inputStream
             val buffer = ByteArray(16 * 1024)
-            while (connected) {
+            while (bluetooth) {
                 val count = input.read(buffer)
                 if (count < 0) break
                 val messages = Core.feed(codec, buffer, count) ?: break
-                for (json in messages) {
-                    try {
-                        handle(JSONObject(json))
-                    } catch (e: Exception) {
-                        Log.w(TAG, "request failed: $e")
-                    }
-                }
+                for (json in messages) received(JSONObject(json), fromNetwork = false)
             }
         } catch (e: Exception) {
             // The computer went away.
@@ -221,14 +239,20 @@ class LinkService : Service() {
     }
 
     private fun close() {
-        connected = false
+        bluetooth = false
         try { socket?.close() } catch (e: Exception) { }
         socket = null
     }
 
-    /** Queues a message for the computer; dropped when it isn't connected. */
+    /**
+     * Queues a message for the computer: on Bluetooth when it's open, the
+     * network otherwise; dropped when neither is.
+     */
     fun send(json: String) {
-        if (!connected) return
+        if (!bluetooth) {
+            if (Net.connected && !Net.send(json)) Log.w(TAG, "refused to send: ${Core.explain(json)}")
+            return
+        }
         val framed = Core.frame(json)
         if (framed == null) {
             Log.w(TAG, "refused to send: ${Core.explain(json)}")
@@ -249,7 +273,8 @@ class LinkService : Service() {
     private fun handle(request: JSONObject) {
         val d = request.optJSONObject("d") ?: JSONObject()
         when (request.getString("t")) {
-            "hello" -> peer = d.optString("name", peer).also { refresh() }
+            "hello" -> if (bluetooth) bluetoothPeer = d.optString("name", bluetoothPeer).also { refresh() } else refresh()
+            "net_invite" -> Net.invited(d.getString("id"), d.optString("name"))
             "ping" -> send(message("pong", JSONObject().put("n", d.optLong("n"))))
             "sync" -> {
                 val what = d.optJSONArray("what") ?: JSONArray()
@@ -283,6 +308,16 @@ class LinkService : Service() {
                 val names = d.optJSONArray("permissions") ?: JSONArray()
                 ask(ArrayList<String>().apply { for (i in 0 until names.length()) add(names.getString(i)) })
             }
+            "get_photos" -> if (Perms.granted(this, Perms.PHOTOS)) Thread { send(photos.page(d.optInt("limit", 60).coerceIn(1, 120), d.optLong("before", 0))) }.start()
+                            else fail("get_photos", "Allow photos on the phone first.")
+            "get_photo" -> Thread { photos.send(d.getLong("id")) }.start()
+            "delete_photos" -> {
+                val ids = d.optJSONArray("ids") ?: JSONArray()
+                main.post { photos.delete((0 until ids.length()).map(ids::getLong)) }
+            }
+            "keyframe_request" -> MirrorService.instance?.keyframe()
+            "mirror_stop" -> main.post { MirrorService.instance?.stop("Stopped from your computer.") }
+            else -> ControlService.handle(request.getString("t"), d)
         }
     }
 
@@ -476,5 +511,6 @@ class LinkService : Service() {
         // matching read permission is granted.
         try { contentResolver.registerContentObserver(Uri.parse("content://sms"), true, smsObserver) } catch (e: Exception) { }
         try { contentResolver.registerContentObserver(CallLog.Calls.CONTENT_URI, true, callObserver) } catch (e: Exception) { }
+        try { contentResolver.registerContentObserver(android.provider.MediaStore.Files.getContentUri("external"), true, photos.observer) } catch (e: Exception) { }
     }
 }

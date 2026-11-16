@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/proto", "desktop", "android/core"]
-default-members = ["crates/proto", "desktop"]
+members = ["crates/proto", "crates/net", "desktop", "android/core"]
+default-members = ["crates/proto", "crates/net", "desktop"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 

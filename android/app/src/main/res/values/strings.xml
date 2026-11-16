@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="control_description">Lets your computer tap, swipe, and type on this phone while you share its screen with Omalink. It only acts during a sharing session you approved by matching the icon on your computer, and Android shows that your screen is being shared the whole time.</string>
+</resources>

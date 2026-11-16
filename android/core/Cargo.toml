@@ -5,9 +5,13 @@ edition.workspace = true
 license.workspace = true
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 omalink-proto = { path = "../../crates/proto" }
 serde_json.workspace = true
 jni = { version = "0.21", default-features = false }
+omalink-net = { path = "../../crates/net" }
+n0-future = "0.3.2"
+serde.workspace = true
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "sync", "time", "macros"] }

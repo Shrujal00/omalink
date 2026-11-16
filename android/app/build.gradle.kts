@@ -1,7 +1,15 @@
+import java.io.File
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
+
+// The release key, if this machine has one.
+val release: Properties? = File(System.getProperty("user.home"), ".config/omalink/release.properties")
+    .takeIf { it.exists() }
+    ?.let { file -> Properties().apply { file.inputStream().use { load(it) } } }
 
 android {
     namespace = "io.omalink"
@@ -11,9 +19,20 @@ android {
         applicationId = "io.omalink"
         minSdk = 29
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.2.0"
         ndk { abiFilters += listOf("arm64-v8a") }
+    }
+
+    signingConfigs {
+        if (release != null) {
+            create("release") {
+                storeFile = file(release.getProperty("storeFile"))
+                storePassword = release.getProperty("storePassword")
+                keyAlias = release.getProperty("keyAlias")
+                keyPassword = release.getProperty("keyPassword")
+            }
+        }
     }
 
     buildTypes {
@@ -23,9 +42,10 @@ android {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            // Signed with the debug key so it installs straight away. Replace
-            // with your own key before publishing anywhere.
-            signingConfig = signingConfigs.getByName("debug")
+            // Releases are signed with the key in ~/.config/omalink/release.properties
+            // (kept out of the repository); without it, the debug key, so
+            // anyone can build and install their own copy.
+            signingConfig = if (release != null) signingConfigs.getByName("release") else signingConfigs.getByName("debug")
         }
     }
 

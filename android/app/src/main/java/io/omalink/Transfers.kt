@@ -87,7 +87,18 @@ class Transfers(private val service: LinkService) {
         false
     }
 
-    private fun say(text: String) = main.post { Toast.makeText(service, text, Toast.LENGTH_LONG).show() }
+    /** Whoever is on screen following sends, such as the Omadrop sheet. Called on the main thread. */
+    interface Watcher {
+        fun progress(name: String, sent: Long, total: Long)
+        fun finished(name: String, ok: Boolean, reason: String)
+    }
+    @Volatile var watcher: Watcher? = null
+
+    private fun progress(name: String, sent: Long, total: Long) = main.post { watcher?.progress(name, sent, total) }
+    private fun finished(name: String, ok: Boolean, reason: String = "") = main.post { watcher?.finished(name, ok, reason) }
+
+    /** A toast, unless something on screen already shows what happened. */
+    private fun say(text: String) = main.post { if (watcher == null) Toast.makeText(service, text, Toast.LENGTH_LONG).show() }
 
     /** This phone's addresses, Wi-Fi first; mobile data ones can't be reached from a computer. */
     private fun addresses(): JSONArray {
@@ -133,17 +144,19 @@ class Transfers(private val service: LinkService) {
 
     /** Phone to computer: `input` is already open, so it outlives whoever shared it. */
     fun offer(name: String, size: Long, input: InputStream) {
+        if (Net.connected) return offerNet(name, size, input)
         Thread {
             var socket: Socket? = null
             val listening = try { listen() } catch (e: Exception) { null }
             try {
-                if (listening == null) return@Thread
+                if (listening == null) { finished(name, false, "Not on the same Wi-Fi as your computer"); return@Thread }
                 val id = System.currentTimeMillis() * 1000 + random.nextInt(1000)
                 service.send(message("file_offer", listening.route.put("id", id).put("name", name).put("size", size)))
                 socket = listening.server.accept()
                 val out = DataOutputStream(socket.getOutputStream().buffered(CHUNK * 2))
                 val chunk = ByteArray(CHUNK)
                 var index = 0L
+                var sent = 0L
                 while (true) {
                     // Fill the chunk; a short read is not the end of the file.
                     var filled = 0
@@ -156,6 +169,8 @@ class Transfers(private val service: LinkService) {
                     out.writeInt(record.size)
                     out.write(record)
                     if (filled == 0) break
+                    sent += filled
+                    progress(name, sent, size)
                 }
                 out.flush()
                 // Wait for the computer to hang up, so nothing is cut off.
@@ -163,14 +178,87 @@ class Transfers(private val service: LinkService) {
                 try { socket.getInputStream().read() } catch (e: Exception) { }
                 say("Sent $name to your computer")
                 remember(name, false, null)
+                finished(name, true)
             } catch (e: java.net.SocketTimeoutException) {
                 say("Your computer couldn't reach the phone. Put both on the same Wi-Fi")
+                finished(name, false, "Your computer couldn't reach the phone")
             } catch (e: Exception) {
                 say("Couldn't send $name")
+                finished(name, false, "Couldn't send it")
             } finally {
                 try { input.close() } catch (e: Exception) { }
                 try { socket?.close() } catch (e: Exception) { }
                 try { listening?.server?.close() } catch (e: Exception) { }
+            }
+        }.start()
+    }
+
+    /**
+     * Phone to computer over the network link: its own stream, encrypted by
+     * the link, finished once the computer has every byte.
+     */
+    private fun offerNet(name: String, size: Long, input: InputStream) {
+        Thread {
+            val id = System.currentTimeMillis() * 1000 + random.nextInt(1000)
+            val handle = Core.netOpenFile(id, name, size)
+            try {
+                if (handle == 0L) { say("Your computer isn't connected"); finished(name, false, "Your computer isn't connected"); return@Thread }
+                val chunk = ByteArray(CHUNK)
+                var sent = 0L
+                while (true) {
+                    val count = input.read(chunk)
+                    if (count < 0) break
+                    if (count > 0 && !Core.netWrite(handle, chunk, count)) throw IllegalStateException("cut off")
+                    sent += count
+                    progress(name, sent, size)
+                }
+                if (!Core.netFinish(handle)) throw IllegalStateException("not confirmed")
+                say("Sent $name to your computer")
+                remember(name, false, null)
+                finished(name, true)
+            } catch (e: Exception) {
+                say("Couldn't send $name")
+                finished(name, false, "The connection was lost")
+            } finally {
+                try { input.close() } catch (e: Exception) { }
+            }
+        }.start()
+    }
+
+    /** Computer to phone over the network link; the bytes are read through the Rust core. */
+    fun receiveNet(handle: Long, id: Long, name: String, size: Long) {
+        Thread {
+            fun saved(ok: Boolean, error: String = "") =
+                service.send(message("file_saved", JSONObject().put("id", id).put("ok", ok).put("error", error)))
+            val resolver = service.contentResolver
+            var uri: Uri? = null
+            try {
+                val safe = name.substringAfterLast('/').substringAfterLast('\\').ifEmpty { "file" }
+                uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, safe)
+                    put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Omalink")
+                    put(MediaStore.Downloads.IS_PENDING, 1)
+                }) ?: throw IllegalStateException("no place to save")
+                var total = 0L
+                resolver.openOutputStream(uri)!!.use { out ->
+                    val buffer = ByteArray(CHUNK)
+                    while (true) {
+                        val count = Core.netRead(handle, buffer)
+                        if (count < 0) throw IllegalStateException("cut off")
+                        if (count == 0) break
+                        out.write(buffer, 0, count)
+                        total += count
+                    }
+                }
+                if (size >= 0 && total != size) throw IllegalStateException("short")
+                resolver.update(uri, ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }, null, null)
+                saved(true)
+                remember(safe, true, uri)
+                arrived(safe, uri)
+            } catch (e: Exception) {
+                Core.netClose(handle)
+                uri?.let { try { resolver.delete(it, null, null) } catch (e: Exception) { } }
+                saved(false, "The file didn't arrive whole.")
             }
         }.start()
     }

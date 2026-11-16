@@ -1,12 +1,12 @@
 pkgname=omalink
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
-pkgdesc='Your Android phone on your desktop: messages, calls, notifications, and the clipboard, over Bluetooth'
+pkgdesc='Your Android phone on your Omarchy desktop: messages, calls, notifications, files, gallery, clipboard and screen sharing'
 arch=('x86_64' 'aarch64')
 license=('MIT')
-depends=('qt6-base' 'qt6-declarative' 'qt6-wayland' 'bluez' 'pipewire' 'wireplumber' 'wl-clipboard')
+depends=('qt6-base' 'qt6-declarative' 'qt6-multimedia' 'qt6-wayland' 'bluez' 'pipewire' 'wireplumber' 'wl-clipboard')
 optdepends=('qt6-webengine: RCS chats through Messages for Web')
-makedepends=('gcc' 'make' 'qt6-webengine')
+makedepends=('gcc' 'make' 'qt6-webengine' 'qt6-multimedia')
 options=('!strip' '!debug' '!lto')
 source=()
 sha256sums=()

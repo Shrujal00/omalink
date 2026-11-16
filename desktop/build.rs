@@ -23,7 +23,9 @@ fn main() {
         .qt_module("Gui")
         .qt_module("Quick")
         .qt_module("QuickControls2")
+        .qt_module("Multimedia")
         .files(["src/bridge.rs"])
         .cpp_file("src/glshare.cpp")
+        .cpp_file("src/videosink.cpp")
         .build();
 }

@@ -7,19 +7,24 @@
 //! into a frame.
 //!
 //! A frame is a 4-byte big-endian length followed by that many bytes of JSON.
+//!
+//! The same messages also travel over the network link (see [`net`]), so a
+//! phone can be reached when it is out of Bluetooth range.
 
 use serde::{Deserialize, Serialize};
+
+pub mod pair;
 
 /// The RFCOMM service the phone listens on and the desktop connects to.
 pub const SERVICE_UUID: &str = "7d3c1a52-9b0e-4f6a-8e21-6f6d616c696e";
 
 /// Bumped whenever a change would confuse an older peer.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Larger frames are treated as a corrupt stream rather than allocated.
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 
-/// How a file crosses the network.
+/// How a file crosses the network over Bluetooth's arrangement.
 ///
 /// Bluetooth is too slow for files, so it only arranges the transfer: the
 /// phone opens a TCP port for one file and tells the desktop where it is and
@@ -32,10 +37,65 @@ pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 /// big-endian bytes; a key is used for one file in one direction, so no
 /// nonce repeats. A record of no plaintext ends the file, which is how a
 /// connection cut short is told from a finished one.
+///
+/// When the network link ([`net`]) is up it carries files itself instead.
 pub mod transfer {
     /// Plaintext bytes per record, except the last two.
     pub const CHUNK: usize = 64 * 1024;
     pub const TAG: usize = 16;
+}
+
+/// The network link: QUIC through iroh, dialed by each device's public key,
+/// so it works on the same Wi-Fi, across the internet, or through a relay.
+///
+/// Two protocols are spoken, told apart by ALPN:
+///
+/// - [`net::PAIR_ALPN`] is open only while the desktop is pairing. One
+///   bidirectional stream carries `Hello` and the icon verification
+///   ([`pair`]); when it succeeds each side remembers the other's key.
+/// - [`net::LINK_ALPN`] is accepted only from a remembered key. Its first
+///   bidirectional stream carries [`Message`]s, framed as on Bluetooth.
+///   Every other stream is unidirectional and starts with one framed
+///   message saying what follows:
+///   - `FileStart`: the file's bytes, until the stream finishes. The
+///     receiver answers `FileSaved` on the message stream.
+///   - `MirrorStream`: the phone's screen as H.264, in [`net::VideoFrame`]
+///     records, until either side stops mirroring.
+pub mod net {
+    pub const PAIR_ALPN: &[u8] = b"omalink/pair/1";
+    pub const LINK_ALPN: &[u8] = b"omalink/link/2";
+    /// The local-network service name both apps advertise and browse.
+    pub const MDNS_SERVICE: &str = "omalink";
+
+    /// One encoded video frame: `len: u32`, `pts_us: u64`, `flags: u8`, then
+    /// `len` bytes of H.264 in Annex B form. All big-endian.
+    pub struct VideoFrame;
+
+    impl VideoFrame {
+        pub const HEADER: usize = 4 + 8 + 1;
+        /// The frame can be decoded on its own.
+        pub const KEY: u8 = 1;
+        /// SPS and PPS, to be fed to the decoder before the next frame.
+        pub const CONFIG: u8 = 2;
+        /// Frames larger than this mean a corrupt stream.
+        pub const MAX: usize = 8 * 1024 * 1024;
+
+        pub fn header(len: usize, pts_us: u64, flags: u8) -> [u8; Self::HEADER] {
+            let mut out = [0u8; Self::HEADER];
+            out[..4].copy_from_slice(&(len as u32).to_be_bytes());
+            out[4..12].copy_from_slice(&pts_us.to_be_bytes());
+            out[12] = flags;
+            out
+        }
+
+        /// `(len, pts_us, flags)`.
+        pub fn parse(header: &[u8; Self::HEADER]) -> (usize, u64, u8) {
+            let len = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+            let mut pts = [0u8; 8];
+            pts.copy_from_slice(&header[4..12]);
+            (len, u64::from_be_bytes(pts), header[12])
+        }
+    }
 }
 
 /// What the phone needs the user's consent for. The names are ours, not
@@ -50,6 +110,11 @@ pub mod permission {
     pub const BLUETOOTH: &str = "bluetooth";
     pub const BATTERY: &str = "battery";
     pub const WALLPAPER: &str = "wallpaper";
+    /// The accessibility service that lets the desktop drive the phone
+    /// during a verified screen-sharing session.
+    pub const CONTROL: &str = "control";
+    /// The phone's photos and videos, for the gallery on the desktop.
+    pub const PHOTOS: &str = "photos";
     pub const ALL: &[&str] = &[
         BLUETOOTH,
         POST_NOTIFICATIONS,
@@ -60,6 +125,8 @@ pub mod permission {
         PHONE,
         BATTERY,
         WALLPAPER,
+        PHOTOS,
+        CONTROL,
     ];
 }
 
@@ -176,6 +243,39 @@ pub enum CallPhase {
     Active,
 }
 
+/// A photo or video on the phone, as the desktop's gallery lists it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct PhoneMedia {
+    /// MediaStore's id; stable while the item exists.
+    pub id: i64,
+    pub name: String,
+    /// "image" or "video".
+    pub kind: String,
+    /// When it was taken, or added if that isn't known; milliseconds.
+    pub time: i64,
+    #[serde(default)]
+    pub size: i64,
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
+    /// Videos only.
+    #[serde(default)]
+    pub duration_ms: i64,
+    /// A small JPEG, base64.
+    #[serde(default)]
+    pub thumb: String,
+}
+
+/// A pointer or finger on the mirrored screen, at `x`, `y` from 0 to 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputKind {
+    Down,
+    Move,
+    Up,
+}
+
 /// Every message either side can send. Tagged as `{"t": "...", "d": {...}}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", content = "d", rename_all = "snake_case")]
@@ -191,6 +291,34 @@ pub enum Message {
     Pong {
         n: u64,
     },
+    /// The phone is the one choosing, the desktop the one showing; see
+    /// [`pair`] for the order these go in.
+    VerifyCommit {
+        purpose: String,
+        commit: String,
+    },
+    VerifyNonce {
+        nonce: String,
+    },
+    VerifyReveal {
+        nonce: String,
+    },
+    /// Whether the person tapped the icon the desktop is showing.
+    VerifyResult {
+        ok: bool,
+    },
+    /// The desktop's last word; on a pairing, both sides now trust each other.
+    VerifyDone {
+        ok: bool,
+    },
+    /// Opens a file stream on the network link. See [`net`].
+    FileStart {
+        id: u64,
+        name: String,
+        size: i64,
+    },
+    /// Stop mirroring, from whichever side.
+    MirrorStop,
     /// Text copied on one side, to be placed on the other's clipboard.
     Clipboard {
         text: String,
@@ -259,6 +387,36 @@ pub enum Message {
         #[serde(default)]
         error: String,
     },
+    /// Opens the video stream of a mirroring session, and says again when the
+    /// screen turns. See [`net`].
+    MirrorStream {
+        width: u32,
+        height: u32,
+    },
+    /// Why the phone isn't mirroring after all: the person said no, or the
+    /// icon didn't match.
+    MirrorEnded {
+        #[serde(default)]
+        reason: String,
+    },
+    /// Whether the phone can be driven from the desktop right now.
+    ControlState {
+        available: bool,
+    },
+    /// A page of the phone's gallery, newest first. `cursor` asks for the
+    /// next page; `more` says whether there is one.
+    Photos {
+        items: Vec<PhoneMedia>,
+        #[serde(default)]
+        more: bool,
+        #[serde(default)]
+        cursor: i64,
+        /// Echoes `GetPhotos.before`: 0 for the first page.
+        #[serde(default)]
+        before: i64,
+    },
+    /// Something was taken, saved or deleted: the gallery is out of date.
+    PhotosChanged,
     /// The home screen wallpaper as a JPEG, base64, cropped to the screen.
     Wallpaper {
         image: String,
@@ -325,6 +483,58 @@ pub enum Message {
     EndCall,
     /// Make the phone ring loudly so it can be found.
     FindPhone,
+    /// The desktop's network address, sent over Bluetooth, so the phone can
+    /// pair over the network even when the two aren't on the same Wi-Fi.
+    NetInvite {
+        id: String,
+        name: String,
+    },
+    /// A page of the gallery: up to `limit` items older than `before`, or
+    /// the newest when it is 0.
+    GetPhotos {
+        limit: u32,
+        #[serde(default)]
+        before: i64,
+    },
+    /// Send this photo or video, as a file, to the desktop.
+    GetPhoto {
+        id: i64,
+    },
+    /// Delete these from the phone. Android asks the person to confirm.
+    DeletePhotos {
+        ids: Vec<i64>,
+    },
+    /// Ask the phone to share its screen. It starts the icon verification.
+    MirrorRequest {
+        /// The longer edge, in pixels, the desktop wants at most.
+        max_size: u32,
+    },
+    /// The decoder lost its place; send a frame it can start from.
+    KeyframeRequest,
+    Input {
+        kind: InputKind,
+        x: f32,
+        y: f32,
+    },
+    /// A wheel or two-finger scroll at `x`, `y`, by `dx`, `dy` notches.
+    Scroll {
+        x: f32,
+        y: f32,
+        dx: f32,
+        dy: f32,
+    },
+    /// "back", "home", "recents", "notifications", or "lock".
+    GlobalAction {
+        action: String,
+    },
+    /// Typed into whatever field has focus on the phone.
+    TypeText {
+        text: String,
+    },
+    /// A key with no text: "enter", "backspace", "tab", "left" and so on.
+    Key {
+        key: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -470,6 +680,32 @@ mod tests {
         assert_eq!(json, r#"{"t":"find_phone"}"#);
         let json = serde_json::to_string(&Message::Dial { number: "123".into() }).unwrap();
         assert_eq!(json, r#"{"t":"dial","d":{"number":"123"}}"#);
+    }
+
+    #[test]
+    fn network_messages_round_trip() {
+        let messages = vec![
+            Message::VerifyCommit { purpose: pair::PAIR.into(), commit: "ab".repeat(32) },
+            Message::VerifyResult { ok: true },
+            Message::FileStart { id: 9, name: "a b.pdf".into(), size: 1234 },
+            Message::MirrorStream { width: 1080, height: 2400 },
+            Message::Input { kind: InputKind::Down, x: 0.5, y: 0.25 },
+            Message::Scroll { x: 0.5, y: 0.5, dx: 0.0, dy: -1.0 },
+            Message::GlobalAction { action: "back".into() },
+            Message::NetInvite { id: "f00".into(), name: "desk".into() },
+        ];
+        let wire: Vec<u8> = messages.iter().flat_map(encode).collect();
+        let mut codec = Codec::new();
+        codec.feed(&wire);
+        for expected in messages {
+            assert_eq!(codec.next(), Ok(Some(expected)));
+        }
+    }
+
+    #[test]
+    fn video_frame_headers_round_trip() {
+        let header = net::VideoFrame::header(70_000, 123_456_789, net::VideoFrame::KEY);
+        assert_eq!(net::VideoFrame::parse(&header), (70_000, 123_456_789, net::VideoFrame::KEY));
     }
 
     #[test]

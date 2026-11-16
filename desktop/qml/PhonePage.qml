@@ -94,10 +94,12 @@ Flickable {
             }
         }
 
+        NetSection { width: parent.width }
+
         // First run: the two things to do.
         Section {
             width: parent.width
-            visible: !Store.connected
+            visible: !Store.connected && Store.net.phones.length === 0
             title: qsTr("Getting connected")
             SettingRow {
                 icon: page.linked && page.linked.paired ? "check" : "bluetooth"

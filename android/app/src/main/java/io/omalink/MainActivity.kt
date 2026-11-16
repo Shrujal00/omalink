@@ -81,6 +81,8 @@ class MainActivity : Activity() {
             addView(column)
         })
         accept(intent)
+        // First launch: the guided setup does the asking, one thing at a time.
+        if (saved == null && SetupActivity.needed(this)) SetupActivity.start(this)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -99,6 +101,7 @@ class MainActivity : Activity() {
         super.onResume()
         LinkService.start(this)
         LinkService.instance?.onChange = ::render
+        Net.onChange = ::render
         // Something may have been granted while we were in Settings.
         LinkService.instance?.sendPermissions()
         render()
@@ -107,6 +110,7 @@ class MainActivity : Activity() {
 
     override fun onPause() {
         LinkService.instance?.onChange = null
+        Net.onChange = null
         super.onPause()
     }
 
@@ -133,6 +137,7 @@ class MainActivity : Activity() {
             Perms.NOTIFICATIONS -> Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
             Perms.BATTERY -> Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))
             Perms.WALLPAPER -> Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName"))
+            Perms.CONTROL -> Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
             else -> return
         }
         try { startActivity(intent) } catch (e: Exception) { }
@@ -211,8 +216,9 @@ class MainActivity : Activity() {
             setPadding(0, dp(14), 0, dp(4))
         })
         val status = when {
-            !Perms.granted(this, Perms.BLUETOOTH) -> "Needs permission to use Bluetooth"
+            connected && service?.bluetooth != true -> if (Net.route == "relay") "Connected over the internet" else "Connected over the network"
             connected -> "Connected"
+            Net.paired().isEmpty() && !Perms.granted(this, Perms.BLUETOOTH) -> "Needs permission to use Bluetooth"
             else -> "Waiting for your computer"
         }
         hero.addView(text("●  $status", 14f, if (connected) green else secondary).apply { gravity = Gravity.CENTER })
@@ -228,12 +234,26 @@ class MainActivity : Activity() {
         }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { marginStart = dp(6) })
         spaced(actions, 20)
 
-        if (!connected) {
+        if (!connected && Net.paired().isEmpty()) {
             spaced(text(
-                "Pair this phone from Omalink on your computer: open Bluetooth settings here so the phone can be found, then press Scan there.",
+                "Pair this phone from Omalink on your computer: open Bluetooth settings here so the phone can be found, then press Scan there. Or pair over the network below to reach it from anywhere.",
                 13.5f, secondary,
             ).apply { setLineSpacing(0f, 1.2f) }, 16)
         }
+
+        if (missing.isNotEmpty()) {
+            spaced(row(R.drawable.ic_shield, "Finish setup", "${missing.size} left · a minute, step by step", accent) {
+                SetupActivity.start(this)
+            }, 16)
+        }
+
+        val paired = Net.paired()
+        spaced(row(
+            R.drawable.ic_computer,
+            if (paired.isEmpty()) "Pair with a computer" else "Computers",
+            if (paired.isEmpty()) "Over Wi-Fi or the internet, checked with icons" else paired.joinToString(", ") { it.second.ifEmpty { "Computer" } },
+            if (paired.isEmpty()) accent else secondary,
+        ) { start(Intent(this, PairActivity::class.java)) }, 16)
 
         // What has gone back and forth since the app started.
         val recent = service?.transfers?.recent()?.take(5) ?: emptyList()

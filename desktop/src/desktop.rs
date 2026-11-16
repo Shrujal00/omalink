@@ -201,3 +201,75 @@ mod tests {
         assert!(!colors.contains_key("name"));
     }
 }
+
+/// Files to send from what was copied: copied files as they are, or a copied
+/// image saved to a file first.
+pub async fn clipboard_files() -> Result<Vec<std::path::PathBuf>, String> {
+    let nothing = || "Copy a file or an image first, then press Ctrl+V here to send it.".to_string();
+    let types = Command::new("wl-paste").arg("--list-types").output().await.map_err(|_| nothing())?;
+    let types = String::from_utf8_lossy(&types.stdout).to_string();
+    if types.lines().any(|t| t == "text/uri-list") {
+        let list = Command::new("wl-paste").args(["--no-newline", "--type", "text/uri-list"]).output().await.map_err(|_| nothing())?;
+        let paths: Vec<std::path::PathBuf> = String::from_utf8_lossy(&list.stdout)
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("file://").map(unescape))
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_file())
+            .collect();
+        if !paths.is_empty() {
+            return Ok(paths);
+        }
+    }
+    let image = ["image/png", "image/jpeg", "image/webp", "image/gif"].into_iter().find(|m| types.lines().any(|t| t == *m));
+    let Some(mime) = image else { return Err(nothing()) };
+    let bytes = Command::new("wl-paste").args(["--no-newline", "--type", mime]).output().await.map_err(|_| nothing())?.stdout;
+    if bytes.is_empty() || bytes.len() > 100 * 1024 * 1024 {
+        return Err(nothing());
+    }
+    let base = std::env::var("XDG_CACHE_HOME").unwrap_or_else(|_| format!("{}/.cache", std::env::var("HOME").unwrap_or_default()));
+    let dir = std::path::PathBuf::from(base).join("omalink/outbox");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let extension = mime.trim_start_matches("image/").replace("jpeg", "jpg");
+    let path = dir.join(format!("Pasted image {}.{extension}", local_stamp()));
+    std::fs::write(&path, bytes).map_err(|e| format!("Couldn't save the copied image: {e}"))?;
+    Ok(vec![path])
+}
+
+/// `%20` and friends back into the characters they stand for.
+fn unescape(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok());
+            if let Some(byte) = hex {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// "2026-11-17 00.42.10", in local time, for file names.
+fn local_stamp() -> String {
+    let now = unsafe { libc::time(std::ptr::null_mut()) };
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&now, &mut tm) };
+    format!("{:04}-{:02}-{:02} {:02}.{:02}.{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
+#[cfg(test)]
+mod url_tests {
+    #[test]
+    fn unescapes_file_urls() {
+        assert_eq!(super::unescape("/home/a/My%20File%E2%9C%93.txt"), "/home/a/My File✓.txt");
+        assert_eq!(super::unescape("/plain/path"), "/plain/path");
+        assert_eq!(super::unescape("/bad%zz%2"), "/bad%zz%2");
+        assert_eq!(super::unescape("/é%é"), "/é%é");
+    }
+}

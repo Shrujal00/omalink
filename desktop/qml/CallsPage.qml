@@ -9,8 +9,28 @@ Item {
 
     property bool missedOnly: false
     property string number: ""
+    property string query: ""
 
-    readonly property var history: missedOnly ? Store.callLog.filter(c => c.kind === "missed" || c.kind === "rejected") : Store.callLog
+    function hit(name, number) {
+        const q = page.query.trim().toLowerCase()
+        if (!q) return true
+        const digits = q.replace(/[\s()+-]/g, "")
+        return (name || "").toLowerCase().indexOf(q) >= 0
+            || (digits.length > 0 && /^\d+$/.test(digits) && (number || "").replace(/[\s()+-]/g, "").indexOf(digits) >= 0)
+    }
+    readonly property var history: (missedOnly ? Store.callLog.filter(c => c.kind === "missed" || c.kind === "rejected") : Store.callLog)
+                                    .filter(c => page.hit(c.name, c.number))
+    // Everyone in the phone's contacts who matches the search.
+    readonly property var people: {
+        if (!query.trim()) return []
+        const out = []
+        for (const c of Store.contacts) {
+            if (c.numbers.length && (page.hit(c.name, "") || c.numbers.some(n => page.hit("", n)))) out.push(c)
+            if (out.length >= 40) break
+        }
+        return out
+    }
+    function focusSearch() { search.forceActiveFocus() }
     readonly property var matches: {
         const q = number.replace(/\s/g, "").toLowerCase()
         if (q.length < 2) return []
@@ -41,21 +61,41 @@ Item {
             id: recents
             anchors { left: parent.left; top: parent.top; bottom: parent.bottom; right: pad.left }
 
-            Row {
+            // Search everyone, and whether to see only missed calls.
+            Item {
                 id: filter
-                anchors { left: parent.left; top: parent.top; margins: 14; leftMargin: 20 }
-                spacing: 6
-                Repeater {
-                    model: [qsTr("All"), qsTr("Missed")]
-                    Btn {
-                        required property string modelData
-                        required property int index
-                        text: modelData
-                        kind: (index === 1) === page.missedOnly ? "soft" : "ghost"
-                        tint: (index === 1) === page.missedOnly ? Theme.foreground : Theme.secondary
-                        implicitHeight: 30
-                        onClicked: page.missedOnly = index === 1
+                anchors { left: parent.left; right: parent.right; top: parent.top; margins: Theme.s4; leftMargin: Theme.s5; rightMargin: Theme.s5 }
+                height: 44
+                Rectangle {
+                    anchors { left: parent.left; right: toggles.left; rightMargin: Theme.s2; top: parent.top; bottom: parent.bottom }
+                    radius: Theme.card
+                    color: Theme.surface
+                    border.width: 1; border.color: search.activeFocus ? Theme.accentLine : Theme.line
+                    Icon { id: glass; name: "search"; size: 17; color: Theme.tertiary; anchors { left: parent.left; leftMargin: 14; verticalCenter: parent.verticalCenter } }
+                    TextInput {
+                        id: search
+                        anchors { left: glass.right; leftMargin: 10; right: clear.left; rightMargin: 6; verticalCenter: parent.verticalCenter }
+                        color: Theme.foreground
+                        font.family: Theme.font; font.pixelSize: Theme.body
+                        clip: true; selectByMouse: true
+                        onTextEdited: page.query = text
+                        Keys.onEscapePressed: { text = ""; page.query = "" }
+                        Text { visible: !search.text; text: qsTr("Search contacts"); color: Theme.tertiary; font: search.font; anchors.verticalCenter: parent.verticalCenter }
                     }
+                    Btn { id: clear; visible: page.query !== ""; icon: "x"; iconSize: 14; kind: "ghost"; tint: Theme.tertiary; implicitWidth: 30; implicitHeight: 30
+                          anchors { right: parent.right; rightMargin: 6; verticalCenter: parent.verticalCenter }
+                          onClicked: { search.text = ""; page.query = "" } }
+                }
+                Row {
+                    id: toggles
+                    anchors { right: parent.right; verticalCenter: parent.verticalCenter }
+                    spacing: 4
+                    Btn { icon: "phone"; iconSize: 16; implicitWidth: 40; implicitHeight: 40; hint: qsTr("All calls")
+                          kind: !page.missedOnly ? "soft" : "ghost"; tint: !page.missedOnly ? Theme.accent : Theme.secondary
+                          onClicked: page.missedOnly = false }
+                    Btn { icon: "in"; iconSize: 16; implicitWidth: 40; implicitHeight: 40; hint: qsTr("Missed calls")
+                          kind: page.missedOnly ? "soft" : "ghost"; tint: page.missedOnly ? Theme.red : Theme.secondary
+                          onClicked: page.missedOnly = true }
                 }
             }
 
@@ -65,6 +105,44 @@ Item {
                 clip: true
                 model: page.history
                 boundsBehavior: Flickable.StopAtBounds
+                header: Column {
+                    width: log.width
+                    visible: page.people.length > 0
+                    height: visible ? implicitHeight + Theme.s3 : 0
+                    Repeater {
+                        model: page.people
+                        Item {
+                            id: person
+                            required property var modelData
+                            width: log.width; height: 60
+                            Rectangle {
+                                anchors { fill: parent; leftMargin: 8; rightMargin: 8; topMargin: 1; bottomMargin: 1 }
+                                radius: Theme.small
+                                color: personHover.hovered ? Theme.hover : "transparent"
+                            }
+                            HoverHandler { id: personHover }
+                            Avatar { id: personFace; name: person.modelData.name; size: 36; anchors { left: parent.left; leftMargin: 20; verticalCenter: parent.verticalCenter } }
+                            Column {
+                                anchors { left: personFace.right; leftMargin: 12; right: personActions.left; rightMargin: 10; verticalCenter: parent.verticalCenter }
+                                spacing: 2
+                                Text { width: parent.width; elide: Text.ElideRight; text: person.modelData.name; color: Theme.foreground
+                                       font.family: Theme.font; font.pixelSize: 14; font.weight: Font.Medium; textFormat: Text.PlainText }
+                                Text { width: parent.width; elide: Text.ElideRight; text: person.modelData.numbers.join("  ·  "); color: Theme.tertiary
+                                       font.family: Theme.font; font.pixelSize: 12 }
+                            }
+                            Row {
+                                id: personActions
+                                anchors { right: parent.right; rightMargin: 18; verticalCenter: parent.verticalCenter }
+                                spacing: 2
+                                Btn { icon: "message"; kind: "ghost"; implicitWidth: 34; implicitHeight: 34; hint: qsTr("Message"); onClicked: page.message(person.modelData.numbers[0]) }
+                                Btn { icon: "phone"; kind: "ghost"; implicitWidth: 34; implicitHeight: 34; hint: qsTr("Call %1").arg(person.modelData.numbers[0]); tint: Theme.green
+                                      onClicked: page.dial(person.modelData.numbers[0]) }
+                            }
+                            TapHandler { onDoubleTapped: page.dial(person.modelData.numbers[0]) }
+                        }
+                    }
+                    Rectangle { visible: log.count > 0; width: log.width - 56; height: 1; color: Theme.line; x: 28 }
+                }
                 ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
                 delegate: Item {
                     id: row
@@ -94,10 +172,9 @@ Item {
                         Icon { name: row.modelData.kind === "outgoing" ? "out" : "in"; size: 12; weight: 1.8
                                color: row.bad ? Theme.red : Theme.tertiary; anchors.verticalCenter: parent.verticalCenter }
                         Text {
-                            text: {
-                                const kind = { incoming: qsTr("Incoming"), outgoing: qsTr("Outgoing"), missed: qsTr("Missed"), rejected: qsTr("Declined") }[row.modelData.kind]
-                                return row.modelData.duration > 0 ? kind + " · " + Store.duration(row.modelData.duration) : kind
-                            }
+                            // The arrow says which way; only how long is left to say.
+                            text: row.modelData.duration > 0 ? Store.duration(row.modelData.duration)
+                                : row.bad ? (row.modelData.kind === "missed" ? qsTr("Missed") : qsTr("Declined")) : ""
                             color: Theme.secondary
                             font.family: Theme.font; font.pixelSize: 12
                         }
@@ -120,9 +197,9 @@ Item {
                 }
                 Empty {
                     anchors.centerIn: parent
-                    visible: log.count === 0
                     icon: "phone"
-                    title: !Store.has("call_log") ? qsTr("Call history needs permission") : page.missedOnly ? qsTr("No missed calls") : qsTr("No recent calls")
+                    visible: log.count === 0 && page.people.length === 0
+                    title: !Store.has("call_log") ? qsTr("Call history needs permission") : page.query ? qsTr("No one by that name") : page.missedOnly ? qsTr("No missed calls") : qsTr("No recent calls")
                     detail: !Store.has("call_log") ? qsTr("Allow it on your phone to see recent calls.") : ""
                     action: !Store.has("call_log") ? qsTr("Ask on phone") : ""
                     onTriggered: Store.send("request_permissions", { permissions: ["call_log", "contacts"] })
@@ -241,19 +318,11 @@ Item {
                     MouseArea { id: go; anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: page.dial() }
                 }
 
-                Text {
-                    width: parent.width
-                    horizontalAlignment: Text.AlignHCenter
-                    wrapMode: Text.WordWrap
-                    visible: !Store.link.calls
-                    text: qsTr("Call audio isn't connected, so calls ring and talk on the phone.")
-                    color: Theme.tertiary
-                    font.family: Theme.font; font.pixelSize: 12
-                }
                 Btn {
                     visible: !Store.link.calls
                     anchors.horizontalCenter: parent.horizontalCenter
-                    text: qsTr("Connect call audio"); kind: "ghost"; tint: Theme.accent; implicitHeight: 28
+                    icon: "mic"; iconSize: 17; kind: "soft"; tint: Theme.accent; implicitWidth: 40; implicitHeight: 36
+                    hint: qsTr("Connect call audio  ·  until then calls ring and talk on the phone")
                     onClicked: Store.send("connect_calls")
                 }
             }

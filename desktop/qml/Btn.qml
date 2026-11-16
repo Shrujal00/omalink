@@ -70,4 +70,7 @@ Item {
         cursorShape: Qt.PointingHandCursor
         onClicked: button.clicked()
     }
+
+    // An icon with no words says what it does on hover.
+    Tip { text: button.hint; visible: area.containsMouse && button.hint !== "" && button.text === "" }
 }

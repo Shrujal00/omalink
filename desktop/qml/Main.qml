@@ -18,16 +18,20 @@ ApplicationWindow {
     property bool helpVisible: false
     // Pages are addressed by name everywhere but the sidebar, so adding one
     // doesn't renumber the rest.
-    readonly property var order: ["messages", "rcs", "calls", "notifications", "clipboard", "files", "phone"]
+    readonly property var order: ["home", "messages", "rcs", "calls", "notifications", "clipboard", "files", "screen", "phone"]
     function go(name) { const i = order.indexOf(name); if (i >= 0) page = i }
+    // In the rail's order. `bottom` ones sit at the foot of the rail; `hot`
+    // badges are in the accent, the rest quieter.
     readonly property var pages: [
-        { icon: "message", label: qsTr("Messages"), badge: Store.unread },
-        { icon: "chat", label: qsTr("RCS chats"), badge: 0 },
-        { icon: "phone", label: qsTr("Calls"), badge: 0 },
-        { icon: "bell", label: qsTr("Notifications"), badge: Store.notifications.length },
-        { icon: "clipboard", label: qsTr("Clipboard"), badge: 0 },
-        { icon: "file", label: qsTr("Files"), badge: Store.transfers.filter(t => t.state === "active" || t.state === "waiting").length },
-        { icon: "device", label: qsTr("Phone"), badge: Store.connected ? Store.missing.length : 0 }
+        { icon: "home", label: qsTr("Home"), key: "Ctrl+1", badge: 0 },
+        { icon: "message", label: qsTr("Messages"), key: "Ctrl+2", badge: Store.unread, hot: true },
+        { icon: "chat", label: qsTr("RCS chats"), key: "Ctrl+3", badge: 0 },
+        { icon: "phone", label: qsTr("Calls"), key: "Ctrl+4", badge: 0 },
+        { icon: "bell", label: qsTr("Notifications"), key: "Ctrl+5", badge: Store.notifications.length },
+        { icon: "clipboard", label: qsTr("Clipboard"), key: "Ctrl+6", badge: 0 },
+        { icon: "image", label: qsTr("Files"), key: "Ctrl+7", badge: Store.transfers.filter(t => t.state === "active" || t.state === "waiting").length, hot: true },
+        { icon: "screen", label: qsTr("Screen"), key: "Ctrl+8", badge: 0 },
+        { icon: "gear", label: qsTr("Phone and settings"), key: "Ctrl+9", badge: Store.connected ? Store.missing.length : 0, bottom: true }
     ]
 
     // Closing the window keeps the link alive, the way a phone companion
@@ -61,10 +65,12 @@ ApplicationWindow {
         }
         function onNote(text) { toast.say(text) }
         function onQuit() { win.quit() }
-        function onShot(path, page, delay) {
+        function onShot(path, page, delay, width, height) {
+            if (width > 0) win.width = width
+            if (height > 0) win.height = height
             shooter.interval = delay
-            win.page = page
-            if (page === 0 && Store.conversations.length) messagesPage.open(Store.conversations[0])
+            win.page = typeof page === "string" ? Math.max(0, win.order.indexOf(page)) : page
+            if (win.order[win.page] === "messages" && Store.conversations.length) messagesPage.open(Store.conversations[0])
             shooter.path = path
             shooter.start()
         }
@@ -78,13 +84,13 @@ ApplicationWindow {
         onTriggered: root.grabToImage(result => { result.saveToFile(shooter.path); win.quit() })
     }
 
-    Shortcut { sequence: "Ctrl+1"; context: Qt.ApplicationShortcut; onActivated: win.page = 0 }
-    Shortcut { sequence: "Ctrl+2"; context: Qt.ApplicationShortcut; onActivated: win.page = 1 }
-    Shortcut { sequence: "Ctrl+3"; context: Qt.ApplicationShortcut; onActivated: win.page = 2 }
-    Shortcut { sequence: "Ctrl+4"; context: Qt.ApplicationShortcut; onActivated: win.page = 3 }
-    Shortcut { sequence: "Ctrl+5"; context: Qt.ApplicationShortcut; onActivated: win.page = 4 }
-    Shortcut { sequence: "Ctrl+6"; context: Qt.ApplicationShortcut; onActivated: win.page = 5 }
-    Shortcut { sequence: "Ctrl+7"; context: Qt.ApplicationShortcut; onActivated: win.page = 6 }
+    Repeater {
+        model: 9
+        Item {
+            required property int index
+            Shortcut { sequence: "Ctrl+" + (index + 1); context: Qt.ApplicationShortcut; onActivated: win.page = index }
+        }
+    }
     Shortcut { sequence: "Ctrl+N"; context: Qt.ApplicationShortcut; onActivated: { win.go("messages"); messagesPage.compose("") } }
     Shortcut { sequence: "Ctrl+F"; context: Qt.ApplicationShortcut; onActivated: { win.go("messages"); messagesPage.focusSearch() } }
     Shortcut { sequence: "Ctrl+D"; context: Qt.ApplicationShortcut; onActivated: { win.go("calls"); callsPage.focusDial() } }
@@ -105,137 +111,12 @@ ApplicationWindow {
 
         Rectangle { anchors.fill: parent; color: Theme.background }
 
-        Rectangle {
+        Rail {
             id: sidebar
-            width: 220
             anchors { left: parent.left; top: parent.top; bottom: parent.bottom }
-            color: Theme.sidebar
-
-            // The phone, at a glance.
-            Item {
-                id: phone
-                height: 72
-                anchors { left: parent.left; right: parent.right; top: parent.top; topMargin: 8 }
-                Rectangle {
-                    anchors { fill: parent; leftMargin: 8; rightMargin: 8 }
-                    radius: Theme.small
-                    color: phoneArea.containsMouse ? Theme.hover : "transparent"
-                    Behavior on color { ColorAnimation { duration: Theme.quick } }
-                }
-                Rectangle {
-                    id: phoneIcon
-                    width: 38; height: 38; radius: Theme.radius > 0 ? 19 : 0
-                    color: Store.connected ? Theme.accentSoft : Theme.hover
-                    anchors { left: parent.left; leftMargin: 18; verticalCenter: parent.verticalCenter }
-                    Icon { visible: !wallpaper.ready; anchors.centerIn: parent; name: "device"; size: 19; color: Store.connected ? Theme.accent : Theme.tertiary }
-                    Picture { id: wallpaper; anchors.fill: parent; radius: parent.radius; source: Store.wallpaper; opacity: Store.connected ? 1 : 0.5 }
-                    Rectangle {
-                        width: 10; height: 10; radius: 5
-                        anchors { right: parent.right; bottom: parent.bottom; margins: -1 }
-                        color: Store.connected ? Theme.green : Store.link.state === "connecting" ? Theme.yellow : Theme.tertiary
-                        border.width: 2; border.color: Theme.sidebar
-                    }
-                }
-                Column {
-                    anchors { left: phoneIcon.right; leftMargin: 11; right: parent.right; rightMargin: 16; verticalCenter: parent.verticalCenter }
-                    spacing: 3
-                    Text {
-                        width: parent.width; elide: Text.ElideRight
-                        text: Store.link.state === "none" ? qsTr("No phone") : (Store.link.name || qsTr("Phone"))
-                        color: Theme.foreground
-                        font.family: Theme.font; font.pixelSize: 14; font.weight: Font.DemiBold
-                    }
-                    Row {
-                        spacing: 6
-                        visible: Store.connected && Store.status
-                        // Battery, drawn: an outline that fills with charge.
-                        Item {
-                            width: 22; height: 11
-                            anchors.verticalCenter: parent.verticalCenter
-                            readonly property int level: Store.status ? Store.status.battery : 0
-                            Rectangle { width: 19; height: 11; radius: 2.5; color: "transparent"; border.width: 1; border.color: Theme.tertiary
-                                Rectangle { x: 2; y: 2; height: 7; radius: 1
-                                    width: Math.max(1, 15 * Math.max(0, parent.parent.level) / 100)
-                                    color: Store.status && Store.status.charging ? Theme.green : parent.parent.level <= 15 ? Theme.red : Theme.secondary } }
-                            Rectangle { x: 20; y: 3.5; width: 2; height: 4; radius: 1; color: Theme.tertiary }
-                        }
-                        Text { text: Store.status && Store.status.battery >= 0 ? Store.status.battery + "%" : ""; color: Theme.secondary; font.family: Theme.font; font.pixelSize: 12; anchors.verticalCenter: parent.verticalCenter }
-                        Icon { visible: Store.status && Store.status.charging; name: "bolt"; size: 11; color: Theme.green; anchors.verticalCenter: parent.verticalCenter }
-                        // Signal bars.
-                        Row {
-                            visible: Store.status && Store.status.signal >= 0
-                            spacing: 1.5
-                            anchors.verticalCenter: parent.verticalCenter
-                            Repeater {
-                                model: 4
-                                Rectangle { required property int index; width: 3; height: 4 + index * 2.3; radius: 1; anchors.bottom: parent.bottom
-                                            color: Store.status && index < Store.status.signal ? Theme.secondary : Theme.pressed }
-                            }
-                        }
-                    }
-                    Text {
-                        visible: !(Store.connected && Store.status)
-                        width: parent.width; elide: Text.ElideRight
-                        text: ({ "connected": qsTr("Connected"), "connecting": qsTr("Connecting…"), "waiting": qsTr("Not connected"), "paused": qsTr("Disconnected"), "none": qsTr("Set up") })[Store.link.state] || ""
-                        color: Theme.secondary
-                        font.family: Theme.font; font.pixelSize: 12
-                    }
-                }
-                MouseArea { id: phoneArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: win.go("phone") }
-            }
-
-            // The marker glides between items rather than jumping.
-            Rectangle {
-                z: 2
-                x: 8; width: 3; height: 18; radius: Math.min(1.5, Theme.radius)
-                y: nav.y + win.page * 40 + 10
-                color: Theme.accent
-                Behavior on y { NumberAnimation { duration: Theme.smooth; easing.type: Easing.OutCubic } }
-            }
-
-            Column {
-                id: nav
-                anchors { left: parent.left; right: parent.right; top: phone.bottom; topMargin: 10 }
-                spacing: 2
-
-                Repeater {
-                    model: win.pages
-                    Item {
-                        id: item
-                        required property var modelData
-                        required property int index
-                        readonly property bool current: win.page === index
-                        width: nav.width; height: 38
-
-                        Rectangle {
-                            anchors { fill: parent; leftMargin: 8; rightMargin: 8 }
-                            radius: Theme.small
-                            color: item.current ? Theme.hover : area.containsMouse ? Theme.hover : "transparent"
-                            Behavior on color { ColorAnimation { duration: Theme.quick } }
-                        }
-                        Icon { id: glyph; name: item.modelData.icon; size: 17
-                               color: item.current ? Theme.foreground : Theme.secondary
-                               anchors { left: parent.left; leftMargin: 24; verticalCenter: parent.verticalCenter } }
-                        Text {
-                            anchors { left: glyph.right; leftMargin: 12; verticalCenter: parent.verticalCenter }
-                            text: item.modelData.label
-                            color: item.current ? Theme.foreground : Theme.secondary
-                            font.family: Theme.font; font.pixelSize: 14
-                            font.weight: item.current ? Font.DemiBold : Font.Normal
-                        }
-                        Rectangle {
-                            visible: item.modelData.badge > 0
-                            anchors { right: parent.right; rightMargin: 20; verticalCenter: parent.verticalCenter }
-                            height: 18; width: Math.max(18, count.implicitWidth + 10); radius: Theme.radius > 0 ? 9 : 2
-                            color: item.index === 0 ? Theme.accent : Theme.pressed
-                            Text { id: count; anchors.centerIn: parent; text: item.modelData.badge > 99 ? "99+" : item.modelData.badge
-                                   color: item.index === 0 ? Theme.onAccent : Theme.secondary
-                                   font.family: Theme.font; font.pixelSize: 11; font.weight: Font.Bold }
-                        }
-                        MouseArea { id: area; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: win.page = item.index }
-                    }
-                }
-            }
+            pages: win.pages
+            current: win.page
+            onPick: index => win.page = index
         }
 
         // Pages cross-fade and rise a little as they come in.
@@ -245,7 +126,8 @@ ApplicationWindow {
             clip: true
 
             component Page: Item {
-                property int index: 0
+                property string name: ""
+                readonly property int index: win.order.indexOf(name)
                 readonly property bool current: win.page === index
                 anchors.fill: parent
                 visible: opacity > 0
@@ -255,26 +137,44 @@ ApplicationWindow {
                 Behavior on opacity { NumberAnimation { duration: 180 } }
             }
 
-            Page { index: 0; MessagesPage { id: messagesPage; anchors.fill: parent; onSetup: win.go("phone") } }
-            Page { index: 1; RcsPage { anchors.fill: parent; current: win.page === 1 } }
-            Page { index: 2; CallsPage { id: callsPage; anchors.fill: parent; onSetup: win.go("phone")
+            Page { name: "home"; HomePage { anchors.fill: parent; current: parent.current
+                                            onGo: name => win.go(name)
+                                            onChooseFiles: filesPage.choose() } }
+            Page { name: "messages"; MessagesPage { id: messagesPage; anchors.fill: parent; onSetup: win.go("phone") } }
+            Page { name: "rcs"; RcsPage { anchors.fill: parent; current: parent.current } }
+            Page { name: "calls"; CallsPage { id: callsPage; anchors.fill: parent; onSetup: win.go("phone")
                                          onMessage: number => {
                                              win.go("messages")
                                              const key = Store.numberKey(number)
                                              const existing = Store.conversations.find(c => Store.numberKey(c.address) === key)
                                              if (existing) messagesPage.open(existing); else messagesPage.compose(number)
                                          } } }
-            Page { index: 3; NotificationsPage { anchors.fill: parent; onSetup: win.go("phone") } }
-            Page { index: 4; ClipboardPage { anchors.fill: parent; onSetup: win.go("phone") } }
-            Page { index: 5; FilesPage { id: filesPage; anchors.fill: parent; onSetup: win.go("phone") } }
-            Page { index: 6; PhonePage { anchors.fill: parent; onConfirmForget: device => confirm.device = device } }
+            Page { name: "notifications"; NotificationsPage { anchors.fill: parent; onSetup: win.go("phone") } }
+            Page { name: "clipboard"; ClipboardPage { anchors.fill: parent; onSetup: win.go("phone") } }
+            Page { name: "files"; FilesPage { id: filesPage; anchors.fill: parent; current: parent.current; onSetup: win.go("phone") } }
+            Page { name: "phone"; PhonePage { anchors.fill: parent; onConfirmForget: device => confirm.device = device } }
+            Page { name: "screen"; MirrorPage { anchors.fill: parent; current: parent.current; onOpenPhone: win.go("phone") } }
 
             // A file dropped on any page goes to the phone.
+            // Files dragged in from elsewhere; a card dragged out of the
+            // Files page is the app's own and isn't sent back.
             DropArea {
+                id: drops
                 anchors.fill: parent
-                enabled: Store.connected
                 keys: ["text/uri-list"]
-                onDropped: drop => { filesPage.send(drop.urls); win.go("files") }
+                onEntered: drag => { if (drag.source) drag.accepted = false }
+                onDropped: drop => {
+                    if (drop.source || !Store.connected) return
+                    filesPage.send(drop.urls)
+                    win.go("files")
+                }
+            }
+            DropOverlay {
+                anchors.fill: parent
+                z: 7
+                active: drops.containsDrag || Store.demoDrop
+                accepting: Store.connected
+                target: Store.link.name
             }
 
             CallPanel { anchors.horizontalCenter: parent.horizontalCenter; z: 5 }
@@ -397,7 +297,7 @@ ApplicationWindow {
                     Text { text: qsTr("Keyboard shortcuts"); color: Theme.foreground; font.family: Theme.font; font.pixelSize: 16; font.weight: Font.DemiBold; bottomPadding: 6 }
                     Repeater {
                         model: [
-                            ["Ctrl+1 … 7", qsTr("Messages, RCS chats, Calls, Notifications, Clipboard, Files, Phone")],
+                            ["Ctrl+1 … 9", qsTr("Home, Messages, RCS chats, Calls, Notifications, Clipboard, Files, Screen, Phone")],
                             ["Ctrl+N", qsTr("New message")],
                             ["Ctrl+F", qsTr("Search messages")],
                             ["Ctrl+D", qsTr("Dial a number")],

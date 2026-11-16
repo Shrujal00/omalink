@@ -11,6 +11,13 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <!-- The network link: finding computers on the local network, and
+         noticing when the phone moves between networks. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- Sharing the screen, only after the icon check and Android's own prompt. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
@@ -19,7 +26,10 @@
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
     <uses-permission android:name="android.permission.READ_CONTACTS" />
     <!-- Reading the wallpaper: plain storage access up to Android 10, all files access after. -->
-    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <!-- The gallery on the computer: browse, download, and (with a confirmation on the phone) delete. -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.READ_CALL_LOG" />
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />
@@ -66,6 +76,50 @@
                 <data android:mimeType="*/*" />
             </intent-filter>
         </activity>
+
+        <!-- Pairing over the network, and the icon check. -->
+        <activity
+            android:name=".PairActivity"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:label="Pair with a computer" />
+
+        <!-- Shows only Android's screen-sharing prompt. -->
+        <activity
+            android:name=".MirrorActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@style/Transparent" />
+
+        <!-- The guided setup, shown on first launch. -->
+        <activity
+            android:name=".SetupActivity"
+            android:exported="false"
+            android:label="Set up Omalink" />
+
+        <!-- Android's own confirmation, for deleting what the computer asked to. -->
+        <activity
+            android:name=".ConfirmActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@style/Transparent" />
+
+        <service
+            android:name=".MirrorService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
+
+        <!-- Taps, swipes and typing from the computer, during a verified session only. -->
+        <service
+            android:name=".ControlService"
+            android:exported="true"
+            android:label="Omalink control from computer"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data android:name="android.accessibilityservice" android:resource="@xml/control" />
+        </service>
 
         <service
             android:name=".LinkService"

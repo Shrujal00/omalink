@@ -22,8 +22,10 @@ object Perms {
     const val PHONE = "phone"
     const val BATTERY = "battery"
     const val WALLPAPER = "wallpaper"
+    const val CONTROL = "control"
+    const val PHOTOS = "photos"
 
-    val all = listOf(BLUETOOTH, POST_NOTIFICATIONS, NOTIFICATIONS, SMS, CONTACTS, CALL_LOG, PHONE, BATTERY, WALLPAPER)
+    val all = listOf(BLUETOOTH, POST_NOTIFICATIONS, NOTIFICATIONS, SMS, CONTACTS, CALL_LOG, PHONE, PHOTOS, BATTERY, WALLPAPER, CONTROL)
 
     val labels = mapOf(
         BLUETOOTH to ("Nearby devices" to "Stay connected to your computer"),
@@ -35,6 +37,8 @@ object Perms {
         PHONE to ("Phone" to "Place, answer, and end calls"),
         BATTERY to ("Run in background" to "Stop Android from putting the app to sleep"),
         WALLPAPER to ("Wallpaper" to "Show this phone's wallpaper on your computer. Android asks for all files access to read it"),
+        PHOTOS to ("Photos and videos" to "Browse, download and delete your gallery from your computer"),
+        CONTROL to ("Control from computer" to "Use the mouse and keyboard on this phone while its screen is shared. Turn on Omalink under Accessibility"),
     )
 
     /** The runtime permissions behind a name; empty for the Settings switches. */
@@ -46,6 +50,8 @@ object Perms {
         CALL_LOG -> arrayOf(Manifest.permission.READ_CALL_LOG)
         PHONE -> arrayOf(Manifest.permission.READ_PHONE_STATE, Manifest.permission.CALL_PHONE, Manifest.permission.ANSWER_PHONE_CALLS)
         WALLPAPER -> if (Build.VERSION.SDK_INT < 30) arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE) else emptyArray()
+        PHOTOS -> if (Build.VERSION.SDK_INT >= 33) arrayOf(Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO)
+                  else arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
         else -> emptyArray()
     }
 
@@ -55,6 +61,10 @@ object Perms {
             enabled.split(':').any { it.startsWith(context.packageName + "/") }
         }
         BATTERY -> context.getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(context.packageName)
+        CONTROL -> {
+            val enabled = Settings.Secure.getString(context.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: ""
+            enabled.split(':').any { it.startsWith(context.packageName + "/") }
+        }
         // Since Android 13 the wallpaper is readable only with all files access.
         WALLPAPER -> if (Build.VERSION.SDK_INT >= 30) Environment.isExternalStorageManager() else has(context, Manifest.permission.READ_EXTERNAL_STORAGE)
         else -> runtime(name).all { context.checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }
